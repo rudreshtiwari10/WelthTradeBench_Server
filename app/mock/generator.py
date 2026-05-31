@@ -57,3 +57,82 @@ def next_tick(last_price: float, symbol: str) -> float:
     """Random-walk one tick from the last price."""
     drift = (random.random() - 0.5) * last_price * 0.0008
     return round(max(1.0, last_price + drift), 2)
+
+
+# ── Derivatives helpers ────────────────────────────────────────────────────
+
+def option_premium_py(spot: float, strike: float, opt_type: str, days: float) -> float:
+    """Black-Scholes-lite premium (mirrors the frontend optionPremium function)."""
+    intrinsic = max(0.0, spot - strike) if opt_type == "CE" else max(0.0, strike - spot)
+    t = max(0.5, days) / 365.0
+    vol = 0.18
+    time_value = (
+        spot * vol * math.sqrt(t)
+        * math.exp(-((spot - strike) / (spot * 0.12)) ** 2 / 2.0)
+    )
+    return max(0.05, round(intrinsic + time_value, 2))
+
+
+def generate_option_candles(
+    underlying: str, strike: float, opt_type: str, expiry: str,
+    interval: str, count: int
+) -> list[dict]:
+    """Synthetic option OHLCV built from underlying spot candles via Black-Scholes."""
+    import datetime as _dt
+    spot_candles = generate_candles(underlying, interval, count + 30)
+    try:
+        expiry_dt = _dt.datetime.strptime(expiry, "%Y-%m-%d")
+    except ValueError:
+        expiry_dt = _dt.datetime.utcnow() + _dt.timedelta(days=30)
+
+    result = []
+    for c in spot_candles[-count:]:
+        candle_dt = _dt.datetime.utcfromtimestamp(c["time"])
+        days_left = max(0.5, (expiry_dt - candle_dt).total_seconds() / 86400.0)
+
+        # CE: high spot → high option.  PE: low spot → high option.
+        o  = option_premium_py(c["open"],  strike, opt_type, days_left)
+        cl = option_premium_py(c["close"], strike, opt_type, days_left)
+        if opt_type == "CE":
+            h = option_premium_py(c["high"], strike, opt_type, days_left)
+            l = option_premium_py(c["low"],  strike, opt_type, days_left)
+        else:
+            h = option_premium_py(c["low"],  strike, opt_type, days_left)
+            l = option_premium_py(c["high"], strike, opt_type, days_left)
+
+        result.append({
+            "time":   c["time"],
+            "open":   o,
+            "high":   max(o, h, l, cl),
+            "low":    min(o, h, l, cl),
+            "close":  cl,
+            "volume": max(1, int(c["volume"] * 0.05)),
+        })
+    return result
+
+
+def generate_futures_candles(
+    underlying: str, expiry: str, interval: str, count: int
+) -> list[dict]:
+    """Synthetic futures OHLCV = spot × cost-of-carry (6.5% p.a.)."""
+    import datetime as _dt
+    spot_candles = generate_candles(underlying, interval, count)
+    try:
+        expiry_dt = _dt.datetime.strptime(expiry, "%Y-%m-%d")
+    except ValueError:
+        expiry_dt = _dt.datetime.utcnow() + _dt.timedelta(days=30)
+
+    result = []
+    for c in spot_candles:
+        candle_dt = _dt.datetime.utcfromtimestamp(c["time"])
+        days_left = max(0.0, (expiry_dt - candle_dt).total_seconds() / 86400.0)
+        factor = 1.0 + 0.065 * days_left / 365.0
+        result.append({
+            "time":   c["time"],
+            "open":   round(c["open"]  * factor, 2),
+            "high":   round(c["high"]  * factor, 2),
+            "low":    round(c["low"]   * factor, 2),
+            "close":  round(c["close"] * factor, 2),
+            "volume": c["volume"],
+        })
+    return result
