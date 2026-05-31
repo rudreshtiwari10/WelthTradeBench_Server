@@ -48,3 +48,19 @@ Notes:
 - `.env` (your real credentials) and `.token.json` (the daily access token) are
   git-ignored and must **never** be committed. Only `.env.example` (blank
   template) is in the repo.
+
+## Deployment on Render
+To deploy this server on [Render](https://render.com/):
+
+1. **Deploy with Blueprint:** Connect your GitHub repository to Render and use the provided `render.yaml` configuration, OR create a **Web Service** manually.
+2. **Manual Configuration (if not using blueprint):**
+   * **Runtime:** `Python`
+   * **Build Command:** `pip install -r requirements.txt`
+   * **Start Command:** `gunicorn -w 4 -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT`
+3. **Environment Variables:** Define the following variables under **Environment** in the Render dashboard:
+   * `PORT`: `8000` (or leave default, Gunicorn will automatically bind to whatever port Render assigns)
+   * `CLIENT_URL`: The URL of your deployed frontend client (e.g., `https://welthchart.onrender.com`)
+   * `UPSTOX_API_KEY`: Your Upstox App Key
+   * `UPSTOX_API_SECRET`: Your Upstox App Secret
+   * `UPSTOX_REDIRECT_URI`: Your production redirect URI (e.g., `https://welthchart-api.onrender.com/auth/callback`)
+   * `UPSTOX_SANDBOX`: `true` or `false`

@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 upstox-python-sdk==2.15.0
 protobuf==5.29.2
 websockets==14.1
+gunicorn==23.0.0
