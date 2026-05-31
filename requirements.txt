@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+python-dotenv==1.0.1
+# Upstox official SDK (Phase 2: OAuth + MarketDataStreamerV3 live feed + protobuf)
+upstox-python-sdk==2.15.0
+protobuf==5.29.2
+websockets==14.1
