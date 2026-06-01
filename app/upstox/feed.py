@@ -24,7 +24,8 @@ class FeedHub:
         self.loop: asyncio.AbstractEventLoop | None = None
         self._mock_task: asyncio.Task | None = None
         self._streamer: Any = None
-        self._streamer_keys: set[str] = set()
+        self._streamer_keys: set[str] = set()   # all keys ever requested
+        self._streamer_ready: bool = False       # True once WS is open
         self._lock = threading.Lock()
 
     @property
@@ -43,15 +44,18 @@ class FeedHub:
         symbol = symbol.upper()
         self.clients.setdefault(ws, set()).add(symbol)
         if self.mode == "upstox":
-            # Real feed only. No mock seeding — the Upstox stream provides ticks
-            # (and during closed-market hours there are simply none, which is
-            # correct: the last real close stays put).
             self._ensure_streamer()
             self._subscribe_upstox(symbol)
         else:
             if symbol not in self.last_price:
-                candles = generate_candles(symbol, "1D", 2)
-                self.last_price[symbol] = candles[-1]["close"]
+                # Only base instruments (indices/equities) get mock tick prices.
+                # Option/future symbols are not in the instruments map; generating
+                # ticks for them at the default ~1000 price would corrupt charts.
+                inst = by_symbol(symbol)
+                if inst:
+                    candles = generate_candles(symbol, "1D", 2)
+                    self.last_price[symbol] = candles[-1]["close"]
+                # else: derivative/unknown — last_price intentionally left absent
             self._ensure_mock_loop()
 
     async def unsubscribe(self, ws: WebSocket, symbol: str) -> None:
@@ -88,8 +92,6 @@ class FeedHub:
         import time as _t
         while True:
             await asyncio.sleep(1.0)
-            # Go silent once authenticated — only the real Upstox feed may emit
-            # ticks. Prevents a loop started pre-login from overwriting real data.
             if self.mode != "mock":
                 continue
             active = self._active_symbols()
@@ -97,7 +99,9 @@ class FeedHub:
                 continue
             now = int(_t.time())
             for sym in active:
-                price = self.last_price.get(sym, 1000.0)
+                price = self.last_price.get(sym)
+                if price is None:
+                    continue  # derivative or unknown symbol — no mock tick
                 self.last_price[sym] = next_tick(price, sym)
                 await self._broadcast(sym, self.last_price[sym], now)
 
@@ -113,11 +117,24 @@ class FeedHub:
                 api_client = upstox_client.ApiClient(cfg)
                 streamer = upstox_client.MarketDataStreamerV3(api_client, [], "ltpc")
                 streamer.on("message", self._on_upstox_message)
+                streamer.on("open", self._on_upstox_open)      # subscribe on connect
                 threading.Thread(target=streamer.connect, daemon=True).start()
                 self._streamer = streamer
             except Exception as exc:  # noqa: BLE001
                 print(f"[feed] Upstox streamer init failed, staying on mock: {exc}")
                 self._streamer = None
+
+    def _on_upstox_open(self) -> None:
+        """Fires on the streamer thread when the Upstox WS connection is established.
+        Subscribes all keys that were requested before the connection was ready."""
+        self._streamer_ready = True
+        pending = list(self._streamer_keys)
+        print(f"[feed] Upstox streamer connected — subscribing {len(pending)} instrument(s): {pending}")
+        if pending and self._streamer is not None:
+            try:
+                self._streamer.subscribe(pending, "ltpc")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[feed] bulk subscribe on open failed: {exc}")
 
     def _subscribe_upstox(self, symbol: str) -> None:
         inst = by_symbol(symbol)
@@ -127,10 +144,13 @@ class FeedHub:
         if key in self._streamer_keys:
             return
         self._streamer_keys.add(key)
-        try:
-            self._streamer.subscribe([key], "ltpc")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[feed] subscribe failed for {key}: {exc}")
+        if self._streamer_ready:
+            # Connection already open — subscribe immediately.
+            try:
+                self._streamer.subscribe([key], "ltpc")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[feed] subscribe failed for {key}: {exc}")
+        # else: connection still opening — _on_upstox_open will subscribe all pending keys.
 
     def _on_upstox_message(self, message: Any) -> None:
         """Runs on the streamer thread. Decode ltpc and hand off to the loop."""
@@ -138,7 +158,6 @@ class FeedHub:
         try:
             feeds = (message or {}).get("feeds", {})
             for key, payload in feeds.items():
-                inst = None
                 from ..instruments import by_key
                 inst = by_key(key)
                 if not inst:

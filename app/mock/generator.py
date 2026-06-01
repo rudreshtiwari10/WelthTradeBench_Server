@@ -11,6 +11,39 @@ INTERVAL_SECONDS = {
     "1D": 86400, "1W": 604800, "1M": 2592000,
 }
 
+# Intraday intervals need NSE-market-aligned timestamps (9:15 AM – 3:30 PM IST).
+_INTRADAY = {"1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H"}
+_IST_OFFSET = 19800   # 5 h 30 min in seconds
+
+
+def _market_bar_times(step: int, count: int) -> list[int]:
+    """Return `count` UTC Unix timestamps for NSE intraday bars, oldest first.
+
+    Only includes bars within Mon–Fri 9:15 AM – 3:30 PM IST so mock hourly
+    (and other intraday) charts look like real NSE data instead of 24 h/day bars.
+    """
+    import datetime as _dt
+
+    IST = _dt.timezone(_dt.timedelta(seconds=_IST_OFFSET))
+    OPEN  = _dt.time(9, 15)
+    CLOSE = _dt.time(15, 30)
+    step_min = step // 60
+    step_td  = _dt.timedelta(seconds=step)
+
+    now = _dt.datetime.now(IST)
+    mins = now.hour * 60 + now.minute
+    bar_min = (mins // step_min) * step_min
+    bar = now.replace(hour=bar_min // 60, minute=bar_min % 60, second=0, microsecond=0)
+
+    result: list[int] = []
+    while len(result) < count:
+        if bar.weekday() < 5 and OPEN <= bar.time() < CLOSE:
+            result.append(int(bar.timestamp()))
+        bar -= step_td
+    result.reverse()
+    return result
+
+
 # Rough starting prices so different symbols look distinct.
 _BASE_PRICE = {
     "NIFTY": 23900, "BANKNIFTY": 51000, "SENSEX": 78000, "FINNIFTY": 23000,
@@ -28,14 +61,18 @@ def generate_candles(symbol: str, interval: str, count: int = 600) -> list[dict]
     seed = sum(ord(c) for c in symbol) * 7919 + count
     rnd = random.Random(seed)
     step = interval_seconds(interval)
-    now = int(time.time())
-    last_time = now - (now % step)
+
+    if interval in _INTRADAY:
+        timestamps = _market_bar_times(step, count)
+    else:
+        now = int(time.time())
+        last_time = now - (now % step)
+        timestamps = [last_time - (count - 1 - i) * step for i in range(count)]
 
     price = _BASE_PRICE.get(symbol.upper(), 1000) * (0.85 + rnd.random() * 0.1)
     vol = 0.012
     out: list[dict] = []
-    for i in range(count - 1, -1, -1):
-        t = last_time - i * step
+    for t in timestamps:
         vol = max(0.004, min(0.035, vol + (rnd.random() - 0.5) * 0.004))
         drift = (rnd.random() - 0.49) * vol
         o = price

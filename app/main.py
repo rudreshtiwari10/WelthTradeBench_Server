@@ -7,6 +7,8 @@ Upstox V2 API for funds, positions, orders, and order placement.
 """
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -34,9 +36,15 @@ class PlaceOrderBody(BaseModel):
     trigger_price: float = 0.0
 
 app = FastAPI(title="Tradomate API", version="0.2.0")
+
+# CORS: CLIENT_URL may be comma-separated (e.g. "http://localhost:5173,https://app.vercel.app").
+# Set CORS_ORIGINS env var to override entirely.
+_raw_cors = os.getenv("CORS_ORIGINS", CLIENT_URL)
+_cors_origins = [o.strip() for o in _raw_cors.split(",") if o.strip()] or [CLIENT_URL]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CLIENT_URL],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -121,11 +129,11 @@ async def history(
     candles: list[dict] = []
     info: dict | None = None
     source = "mock"
+    source_warning: str | None = None   # surfaced to frontend when Upstox falls back to mock
 
     # ── Direct instrument-key path (options / futures) ────────────────
     if instrument_key:
         if instrument_key.startswith("MOCK:option:"):
-            # MOCK:option:{underlying}:{strike}:{type}:{expiry}
             try:
                 _, _, ul, strike_s, otype, expiry = instrument_key.split(":")
                 candles = generate_option_candles(ul, float(strike_s), otype, expiry, interval, count)
@@ -133,7 +141,6 @@ async def history(
             except Exception as exc:  # noqa: BLE001
                 print(f"[history] mock-option parse failed: {exc}")
         elif instrument_key.startswith("MOCK:future:"):
-            # MOCK:future:{underlying}:{expiry}
             try:
                 _, _, ul, expiry = instrument_key.split(":")
                 candles = generate_futures_candles(ul, expiry, interval, count)
@@ -141,7 +148,6 @@ async def history(
             except Exception as exc:  # noqa: BLE001
                 print(f"[history] mock-future parse failed: {exc}")
         elif hub.mode == "upstox":
-            # Real Upstox instrument key (e.g. "NSE_FO|141398")
             try:
                 tmp = Instrument(
                     symbol=symbol, name=symbol,
@@ -151,7 +157,9 @@ async def history(
                 info = {"symbol": symbol, "name": symbol, "exchange": "NSE_FO", "kind": "option"}
                 source = "upstox"
             except Exception as exc:  # noqa: BLE001
-                print(f"[history] direct-key Upstox failed ({instrument_key}): {exc}")
+                reason = str(exc)
+                print(f"[history] direct-key Upstox failed ({instrument_key}): {reason}")
+                source_warning = f"Upstox unavailable for this instrument ({interval}): {reason}"
 
     # ── Symbol-based fallback ─────────────────────────────────────────
     if not candles:
@@ -161,7 +169,9 @@ async def history(
                 candles = await rest.historical_candles(inst, interval, count)
                 source = "upstox"
             except Exception as exc:  # noqa: BLE001
-                print(f"[history] Upstox fetch failed ({symbol} {interval}); using mock: {exc}")
+                reason = str(exc)
+                print(f"[history] Upstox fetch failed ({symbol} {interval}): {reason}")
+                source_warning = f"Upstox data unavailable for {symbol} {interval}: {reason}"
         if not candles:
             candles = generate_candles(symbol, interval, count)
         if info is None:
@@ -170,7 +180,11 @@ async def history(
                 if inst else {"symbol": symbol, "name": symbol, "exchange": "NSE", "kind": "stock"}
             )
 
-    return {"symbol": symbol, "interval": interval, "source": source, "info": info or {}, "candles": candles}
+    return {
+        "symbol": symbol, "interval": interval,
+        "source": source, "source_warning": source_warning,
+        "info": info or {}, "candles": candles,
+    }
 
 
 # ── Quote ─────────────────────────────────────────────────────────────────
@@ -325,6 +339,9 @@ async def derivatives_chain(underlying: str, expiry: str) -> dict:
     if hub.mode == "upstox" and inst:
         try:
             raw = await rest.get_option_chain(inst.instrument_key, expiry)
+            if not raw:
+                raise ValueError(f"No option contracts found for expiry '{expiry}'. Check if the date is a valid trading expiry.")
+            
             chains = []
             for row in raw:
                 call = row.get("call_options") or {}
@@ -349,8 +366,9 @@ async def derivatives_chain(underlying: str, expiry: str) -> dict:
             return {"source": "upstox", "sandbox": SANDBOX, "spot": spot, "chains": chains}
         except Exception as exc:  # noqa: BLE001
             print(f"[derivatives] chain upstox error: {exc}")
+            raise HTTPException(status_code=502, detail=str(exc))
 
-    # Mock synthetic chain
+    # Mock synthetic chain (ONLY runs if hub.mode == "mock")
     spot_candles = generate_candles(underlying, "1D", 2)
     spot = spot_candles[-1]["close"]
 
