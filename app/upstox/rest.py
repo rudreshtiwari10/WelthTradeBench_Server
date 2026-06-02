@@ -356,3 +356,30 @@ async def get_option_chain(underlying_key: str, expiry_date: str) -> list[dict]:
         if not r.is_success:
             _upstox_raise(r)
     return r.json().get("data") or []
+
+
+async def get_option_expiries(underlying_key: str) -> list[str]:
+    """Return a sorted list of available option expiry dates (YYYY-MM-DD) from Upstox.
+
+    Calls /v2/option/contract without an expiry_date filter to discover every
+    listed contract for the underlying, then extracts and deduplicates the expiry
+    dates, filtering out dates in the past.
+    """
+    key = urllib.parse.quote(underlying_key, safe="")
+    url = f"{API_BASE}/v2/option/contract?instrument_key={key}"
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(url, headers=_headers())
+        if not r.is_success:
+            _upstox_raise(r)
+    data = r.json().get("data") or []
+    today = (datetime.now(timezone.utc) + _IST).date().isoformat()
+    seen: set[str] = set()
+    for contract in data:
+        raw = contract.get("expiry")
+        if not raw:
+            continue
+        # Upstox may return "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS+05:30"
+        date_str = str(raw)[:10]
+        if len(date_str) == 10 and date_str >= today:
+            seen.add(date_str)
+    return sorted(seen)

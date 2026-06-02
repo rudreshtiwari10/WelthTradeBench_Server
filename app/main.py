@@ -217,6 +217,14 @@ async def ws(websocket: WebSocket) -> None:
                 await hub.subscribe(websocket, symbol)
             elif action == "unsub" and symbol:
                 await hub.unsubscribe(websocket, symbol)
+            elif action == "sub_options":
+                keys = [k for k in (data.get("keys") or []) if isinstance(k, str)]
+                if keys:
+                    await hub.subscribe_option_keys(websocket, keys)
+            elif action == "unsub_options":
+                keys = [k for k in (data.get("keys") or []) if isinstance(k, str)]
+                if keys:
+                    await hub.unsubscribe_option_keys(websocket, keys)
     except WebSocketDisconnect:
         pass
     finally:
@@ -322,58 +330,147 @@ async def broker_cancel_order(order_id: str) -> dict:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-# ── Option chain ──────────────────────────────────────────────────────────
-
 # ═══════════════════════════════════════════════════════════════════════════
 # DERIVATIVES  (/api/derivatives/*)
-# Separate from /api/broker/* — these work in BOTH mock and upstox mode.
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.get("/api/derivatives/chain")
-async def derivatives_chain(underlying: str, expiry: str) -> dict:
-    """Option chain for an underlying + expiry.
-    Upstox mode: real chain with live LTPs and instrument keys.
-    Mock mode: synthetic chain via Black-Scholes with MOCK: instrument keys."""
+import datetime as _dt, calendar as _cal
+
+
+def _mock_expiry_dates(underlying: str) -> list[str]:
+    """Compute expected option expiry dates for mock/demo mode.
+
+    Python weekday: Mon=0 Tue=1 Wed=2 Thu=3 Fri=4
+    NIFTY/SENSEX → next 6 weekly (Thu/Fri).
+    Others       → next 4 monthly (last Thu/Tue/Mon of month).
+    """
+    ul = underlying.upper()
+    today = _dt.date.today()
+
+    WEEKLY_WD  = {"NIFTY": 3, "SENSEX": 4}          # Thu, Fri
+    MONTHLY_WD = {                                    # last weekday of month
+        "BANKNIFTY": 3, "FINNIFTY": 1,
+        "MIDCPNIFTY": 0, "BANKEX": 0,
+    }
+
+    results: list[str] = []
+
+    if ul in WEEKLY_WD:
+        wd, n = WEEKLY_WD[ul], 6
+        d = today
+        while len(results) < n:
+            ahead = (wd - d.weekday() + 7) % 7 or 7
+            d = d + _dt.timedelta(days=ahead)
+            results.append(d.isoformat())
+    else:
+        wd = MONTHLY_WD.get(ul, 3)
+        year, month, n = today.year, today.month, 4
+        while len(results) < n:
+            last_day  = _cal.monthrange(year, month)[1]
+            last_date = _dt.date(year, month, last_day)
+            back      = (last_date.weekday() - wd + 7) % 7
+            exp_date  = last_date - _dt.timedelta(days=back)
+            if exp_date >= today:
+                results.append(exp_date.isoformat())
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+
+    return results
+
+
+def _parse_chain_row(row: dict) -> dict:
+    call = row.get("call_options") or {}
+    put  = row.get("put_options")  or {}
+    cmd  = call.get("market_data") or {}
+    pmd  = put.get("market_data")  or {}
+    # Use close_price as fallback when ltp is 0 (market closed / pre-open)
+    call_ltp = cmd.get("ltp") or cmd.get("close_price") or 0
+    put_ltp  = pmd.get("ltp") or pmd.get("close_price") or 0
+    return {
+        "strike":  row.get("strike_price"),
+        "expiry":  row.get("expiry"),
+        "callKey": call.get("instrument_key"),
+        "callLtp": call_ltp,
+        "callBid": cmd.get("bid_price") or 0,
+        "callAsk": cmd.get("ask_price") or 0,
+        "callOi":  cmd.get("oi") or 0,
+        "putKey":  put.get("instrument_key"),
+        "putLtp":  put_ltp,
+        "putBid":  pmd.get("bid_price") or 0,
+        "putAsk":  pmd.get("ask_price") or 0,
+        "putOi":   pmd.get("oi") or 0,
+    }
+
+
+@app.get("/api/derivatives/expiries")
+async def derivatives_expiries(underlying: str) -> dict:
+    """Available option expiry dates for an underlying.
+
+    Upstox mode: fetches the real list of listed contracts from Upstox and
+                 returns the unique expiry dates (sorted, future only).
+    Mock mode:   returns locally-computed expected dates for demo purposes.
+    """
     inst = by_symbol(underlying)
 
     if hub.mode == "upstox" and inst:
         try:
-            raw = await rest.get_option_chain(inst.instrument_key, expiry)
-            if raw:
-                chains = []
-                for row in raw:
-                    call = row.get("call_options") or {}
-                    put  = row.get("put_options")  or {}
-                    cmd  = call.get("market_data") or {}
-                    pmd  = put.get("market_data")  or {}
-                    # Fall back to close_price when ltp is 0 (market closed / pre-open)
-                    call_ltp = cmd.get("ltp") or cmd.get("close_price") or 0
-                    put_ltp  = pmd.get("ltp") or pmd.get("close_price") or 0
-                    chains.append({
-                        "strike":  row.get("strike_price"),
-                        "expiry":  row.get("expiry"),
-                        "callKey": call.get("instrument_key"),
-                        "callLtp": call_ltp,
-                        "callBid": cmd.get("bid_price") or 0,
-                        "callAsk": cmd.get("ask_price") or 0,
-                        "callOi":  cmd.get("oi") or 0,
-                        "putKey":  put.get("instrument_key"),
-                        "putLtp":  put_ltp,
-                        "putBid":  pmd.get("bid_price") or 0,
-                        "putAsk":  pmd.get("ask_price") or 0,
-                        "putOi":   pmd.get("oi") or 0,
-                    })
-                spot = raw[0].get("underlying_spot_price") or 0 if raw else 0
-                return {"source": "upstox", "sandbox": SANDBOX, "spot": spot, "chains": chains}
-            print(f"[derivatives] chain empty from Upstox for {underlying} {expiry}, using synthetic fallback")
+            dates = await rest.get_option_expiries(inst.instrument_key)
+            if dates:
+                return {"source": "upstox", "underlying": underlying, "expiries": dates}
+            # Empty → Upstox returned nothing (unusual, but handle gracefully)
+            raise HTTPException(
+                status_code=404,
+                detail=f"No option contracts found for {underlying} on Upstox."
+            )
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
-            print(f"[derivatives] chain upstox error ({underlying} {expiry}): {exc}, using synthetic fallback")
+            print(f"[derivatives] expiries upstox error ({underlying}): {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # Synthetic chain — runs in mock mode OR as Upstox fallback when chain unavailable
+    # Mock mode
+    dates = _mock_expiry_dates(underlying)
+    return {"source": "mock", "underlying": underlying, "expiries": dates}
+
+
+@app.get("/api/derivatives/chain")
+async def derivatives_chain(underlying: str, expiry: str) -> dict:
+    """Option chain for an underlying + expiry.
+
+    Upstox mode: returns ONLY real Upstox data.  Never falls back to synthetic
+                 prices — that would give the user fabricated LTPs and MOCK
+                 instrument keys that cannot be used for real orders.
+    Mock mode:   returns a synthetic Black-Scholes chain with MOCK: keys.
+    """
+    inst = by_symbol(underlying)
+
+    if hub.mode == "upstox":
+        if not inst:
+            raise HTTPException(status_code=404, detail=f"Unknown underlying: {underlying}")
+        try:
+            raw = await rest.get_option_chain(inst.instrument_key, expiry)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[derivatives] chain upstox error ({underlying} {expiry}): {exc}")
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        if not raw:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No option chain data for {underlying} expiry {expiry}. "
+                    "Use the expiry selector to pick a valid listed date."
+                ),
+            )
+
+        chains = [_parse_chain_row(r) for r in raw]
+        spot   = raw[0].get("underlying_spot_price") or 0
+        return {"source": "upstox", "sandbox": SANDBOX, "spot": spot, "chains": chains}
+
+    # ── Mock / demo mode only below ───────────────────────────────────────
     spot_candles = generate_candles(underlying, "1D", 2)
     spot = spot_candles[-1]["close"]
 
-    import datetime as _dt
     try:
         expiry_dt = _dt.datetime.strptime(expiry, "%Y-%m-%d")
         days_left = max(1.0, (expiry_dt.date() - _dt.datetime.utcnow().date()).days)
@@ -381,10 +478,10 @@ async def derivatives_chain(underlying: str, expiry: str) -> dict:
         days_left = 7.0
 
     step = 100 if underlying.upper() in ("BANKNIFTY", "SENSEX", "BANKEX") else 50
-    atm = round(spot / step) * step
+    atm  = round(spot / step) * step
     chains = []
     for i in range(-12, 13):
-        k = atm + i * step
+        k  = atm + i * step
         cl = option_premium_py(spot, k, "CE", days_left)
         pl = option_premium_py(spot, k, "PE", days_left)
         chains.append({
