@@ -339,36 +339,37 @@ async def derivatives_chain(underlying: str, expiry: str) -> dict:
     if hub.mode == "upstox" and inst:
         try:
             raw = await rest.get_option_chain(inst.instrument_key, expiry)
-            if not raw:
-                raise ValueError(f"No option contracts found for expiry '{expiry}'. Check if the date is a valid trading expiry.")
-            
-            chains = []
-            for row in raw:
-                call = row.get("call_options") or {}
-                put  = row.get("put_options")  or {}
-                cmd  = call.get("market_data") or {}
-                pmd  = put.get("market_data")  or {}
-                chains.append({
-                    "strike":  row.get("strike_price"),
-                    "expiry":  row.get("expiry"),
-                    "callKey": call.get("instrument_key"),
-                    "callLtp": cmd.get("ltp") or 0,
-                    "callBid": cmd.get("bid_price") or 0,
-                    "callAsk": cmd.get("ask_price") or 0,
-                    "callOi":  cmd.get("oi") or 0,
-                    "putKey":  put.get("instrument_key"),
-                    "putLtp":  pmd.get("ltp") or 0,
-                    "putBid":  pmd.get("bid_price") or 0,
-                    "putAsk":  pmd.get("ask_price") or 0,
-                    "putOi":   pmd.get("oi") or 0,
-                })
-            spot = raw[0].get("underlying_spot_price", 0) if raw else 0
-            return {"source": "upstox", "sandbox": SANDBOX, "spot": spot, "chains": chains}
+            if raw:
+                chains = []
+                for row in raw:
+                    call = row.get("call_options") or {}
+                    put  = row.get("put_options")  or {}
+                    cmd  = call.get("market_data") or {}
+                    pmd  = put.get("market_data")  or {}
+                    # Fall back to close_price when ltp is 0 (market closed / pre-open)
+                    call_ltp = cmd.get("ltp") or cmd.get("close_price") or 0
+                    put_ltp  = pmd.get("ltp") or pmd.get("close_price") or 0
+                    chains.append({
+                        "strike":  row.get("strike_price"),
+                        "expiry":  row.get("expiry"),
+                        "callKey": call.get("instrument_key"),
+                        "callLtp": call_ltp,
+                        "callBid": cmd.get("bid_price") or 0,
+                        "callAsk": cmd.get("ask_price") or 0,
+                        "callOi":  cmd.get("oi") or 0,
+                        "putKey":  put.get("instrument_key"),
+                        "putLtp":  put_ltp,
+                        "putBid":  pmd.get("bid_price") or 0,
+                        "putAsk":  pmd.get("ask_price") or 0,
+                        "putOi":   pmd.get("oi") or 0,
+                    })
+                spot = raw[0].get("underlying_spot_price") or 0 if raw else 0
+                return {"source": "upstox", "sandbox": SANDBOX, "spot": spot, "chains": chains}
+            print(f"[derivatives] chain empty from Upstox for {underlying} {expiry}, using synthetic fallback")
         except Exception as exc:  # noqa: BLE001
-            print(f"[derivatives] chain upstox error: {exc}")
-            raise HTTPException(status_code=502, detail=str(exc))
+            print(f"[derivatives] chain upstox error ({underlying} {expiry}): {exc}, using synthetic fallback")
 
-    # Mock synthetic chain (ONLY runs if hub.mode == "mock")
+    # Synthetic chain — runs in mock mode OR as Upstox fallback when chain unavailable
     spot_candles = generate_candles(underlying, "1D", 2)
     spot = spot_candles[-1]["close"]
 
@@ -463,13 +464,13 @@ async def broker_option_chain(underlying: str, expiry: str) -> dict:
                 "strike": row.get("strike_price"),
                 "expiry": row.get("expiry"),
                 "callKey": call.get("instrument_key"),
-                "callLtp": call_md.get("ltp") or 0,
+                "callLtp": call_md.get("ltp") or call_md.get("close_price") or 0,
                 "callBid": call_md.get("bid_price") or 0,
                 "callAsk": call_md.get("ask_price") or 0,
                 "callOi":  call_md.get("oi") or 0,
                 "callVol": call_md.get("volume") or 0,
                 "putKey":  put.get("instrument_key"),
-                "putLtp":  put_md.get("ltp") or 0,
+                "putLtp":  put_md.get("ltp") or put_md.get("close_price") or 0,
                 "putBid":  put_md.get("bid_price") or 0,
                 "putAsk":  put_md.get("ask_price") or 0,
                 "putOi":   put_md.get("oi") or 0,
