@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
 from .instruments import Instrument, by_symbol, search
+from .mcx_instruments import refresh as _mcx_refresh
 from .mock.generator import (
     generate_candles, generate_option_candles,
     generate_futures_candles, option_premium_py,
@@ -51,9 +52,28 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def _startup() -> None:
+    """Pre-fetch MCX active contract keys so the first commodity subscription
+    doesn't have to wait for the CDN download."""
+    try:
+        await _mcx_refresh()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] MCX instrument prefetch failed (will retry on first subscribe): {exc}")
+
+
 @app.get("/api/health")
 async def health() -> dict:
     return {"status": "ok", "mode": hub.mode}
+
+
+@app.post("/api/mcx/refresh")
+async def mcx_refresh() -> dict:
+    """Force-refresh the MCX active contract key cache from Upstox CDN.
+    Useful after a monthly contract rollover."""
+    from .mcx_instruments import refresh as _r, active_keys
+    keys = await _r()
+    return {"ok": True, "contracts": keys}
 
 
 @app.get("/api/auth/status")
@@ -501,10 +521,51 @@ async def derivatives_chain(underlying: str, expiry: str) -> dict:
     return {"source": "mock", "sandbox": False, "spot": spot, "chains": chains}
 
 
+def _mcx_expiry_day(underlying: str, yr: int, mon: int) -> "_dt.date":
+    """Return the MCX expiry date for a commodity in a given year/month.
+
+    MCX expiry rules (simplified; if the computed day is a holiday it would
+    fall back — we use the raw calendar day here for demo/mock purposes):
+      GOLD / GOLDM / GOLDPETAL / SILVER / SILVERM / SILVERMIC → 5th of month
+      CRUDEOIL / CRUDEOILM                                    → 19th of month
+      NATURALGAS                                              → 24th of month
+      Others (base metals)                                    → last day of month
+    """
+    import calendar as _cal
+    ul = underlying.upper()
+    if ul in {"GOLD", "GOLDM", "GOLDPETAL", "SILVER", "SILVERM", "SILVERMIC"}:
+        day = 5
+    elif ul in {"CRUDEOIL", "CRUDEOILM"}:
+        day = 19
+    elif ul == "NATURALGAS":
+        day = 24
+    else:
+        day = _cal.monthrange(yr, mon)[1]  # last day of month
+    # Roll back if it's a weekend (Sat→Fri, Sun→Fri)
+    d = _dt.date(yr, mon, day)
+    while d.weekday() >= 5:
+        d -= _dt.timedelta(days=1)
+    return d
+
+
+_MCX_COMMODITIES = {
+    "GOLD", "GOLDM", "GOLDPETAL",
+    "SILVER", "SILVERM", "SILVERMIC",
+    "CRUDEOIL", "CRUDEOILM",
+    "NATURALGAS",
+    "COPPER", "COPPERM",
+    "ZINC", "ZINCP",
+    "ALUMINIUM", "ALUMINIM",
+    "NICKEL", "NICKELM",
+    "LEAD", "LEADM",
+}
+
+
 @app.get("/api/derivatives/futures")
 async def derivatives_futures(underlying: str) -> dict:
     """List of futures contracts (next 3 monthly expiries) for an underlying.
-    Always returns data in both mock and upstox mode."""
+    Handles both NSE index futures (last-Thursday rule) and MCX commodity futures
+    (commodity-specific expiry day). Always returns data in both mock and Upstox mode."""
     import datetime as _dt, calendar as _cal
 
     inst = by_symbol(underlying)
@@ -513,31 +574,55 @@ async def derivatives_futures(underlying: str) -> dict:
 
     today = _dt.datetime.utcnow().date()
     futures = []
+    is_mcx = underlying.upper() in _MCX_COMMODITIES
+    carry_rate = 0.06 if is_mcx else 0.065
+    exchange   = inst.exchange if inst else ("MCX" if is_mcx else "NSE")
 
-    for months_ahead in range(3):
-        yr  = today.year + (today.month + months_ahead - 1) // 12
-        mon = (today.month + months_ahead - 1) % 12 + 1
-        last_day = _cal.monthrange(yr, mon)[1]
-        # Last Thursday of the month
-        dt = _dt.datetime(yr, mon, last_day)
-        while dt.weekday() != 3:
-            dt -= _dt.timedelta(days=1)
+    if is_mcx:
+        # Walk forward month by month collecting the next 3 active contracts.
+        yr, mon = today.year, today.month
+        while len(futures) < 3:
+            dt = _mcx_expiry_day(underlying, yr, mon)
+            if dt >= today:
+                expiry_str   = dt.strftime("%Y-%m-%d")
+                expiry_label = dt.strftime("%d %b %Y")
+                days_left    = max(1, (dt - today).days)
+                futures.append({
+                    "symbol":        f"{underlying}FUT",
+                    "name":          f"{underlying} Futures {expiry_label}",
+                    "exchange":      exchange,
+                    "expiry":        expiry_str,
+                    "expiryLabel":   expiry_label,
+                    "ltp":           round(spot * (1.0 + carry_rate * days_left / 365.0), 2),
+                    "instrumentKey": f"MOCK:future:{underlying}:{expiry_str}",
+                    "kind":          "future",
+                })
+            # Advance to next month
+            mon += 1
+            if mon > 12:
+                mon, yr = 1, yr + 1
+    else:
+        for months_ahead in range(3):
+            yr  = today.year + (today.month + months_ahead - 1) // 12
+            mon = (today.month + months_ahead - 1) % 12 + 1
+            last_day = _cal.monthrange(yr, mon)[1]
+            dt = _dt.date(yr, mon, last_day)
+            while dt.weekday() != 3:
+                dt -= _dt.timedelta(days=1)
 
-        expiry_str   = dt.strftime("%Y-%m-%d")
-        expiry_label = dt.strftime("%d %b %Y")
-        days_left    = max(1, (dt.date() - today).days)
-        fut_price    = round(spot * (1.0 + 0.065 * days_left / 365.0), 2)
-
-        futures.append({
-            "symbol":        f"{underlying}FUT",
-            "name":          f"{underlying} Futures {expiry_label}",
-            "exchange":      inst.exchange if inst else "NSE",
-            "expiry":        expiry_str,
-            "expiryLabel":   expiry_label,
-            "ltp":           fut_price,
-            "instrumentKey": f"MOCK:future:{underlying}:{expiry_str}",
-            "kind":          "future",
-        })
+            expiry_str   = dt.strftime("%Y-%m-%d")
+            expiry_label = dt.strftime("%d %b %Y")
+            days_left    = max(1, (dt - today).days)
+            futures.append({
+                "symbol":        f"{underlying}FUT",
+                "name":          f"{underlying} Futures {expiry_label}",
+                "exchange":      exchange,
+                "expiry":        expiry_str,
+                "expiryLabel":   expiry_label,
+                "ltp":           round(spot * (1.0 + carry_rate * days_left / 365.0), 2),
+                "instrumentKey": f"MOCK:future:{underlying}:{expiry_str}",
+                "kind":          "future",
+            })
 
     return {"source": hub.mode, "underlying": underlying, "futures": futures}
 

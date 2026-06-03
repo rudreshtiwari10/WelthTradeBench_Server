@@ -16,18 +16,32 @@ _INTRADAY = {"1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H"}
 _IST_OFFSET = 19800   # 5 h 30 min in seconds
 
 
-def _market_bar_times(step: int, count: int) -> list[int]:
-    """Return `count` UTC Unix timestamps for NSE intraday bars, oldest first.
+_MCX_SYMBOLS = {
+    "GOLD", "GOLDM", "GOLDPETAL",
+    "SILVER", "SILVERM", "SILVERMIC",
+    "CRUDEOIL", "CRUDEOILM",
+    "NATURALGAS",
+    "COPPER", "COPPERM",
+    "ZINC", "ZINCP",
+    "ALUMINIUM", "ALUMINIM",
+    "NICKEL", "NICKELM",
+    "LEAD", "LEADM",
+}
 
-    Only includes bars within Mon–Fri 9:15 AM – 3:30 PM IST so mock hourly
-    (and other intraday) charts look like real NSE data instead of 24 h/day bars.
+
+def _market_bar_times(step: int, count: int, symbol: str = "") -> list[int]:
+    """Return `count` UTC Unix timestamps for intraday bars, oldest first.
+
+    NSE  (default): Mon–Fri 9:15 AM – 3:30 PM IST
+    MCX commodities: Mon–Fri 9:00 AM – 11:30 PM IST (extended evening session)
     """
     import datetime as _dt
 
     IST = _dt.timezone(_dt.timedelta(seconds=_IST_OFFSET))
-    OPEN  = _dt.time(9, 15)
-    CLOSE = _dt.time(15, 30)
-    step_min = step // 60
+    is_mcx = symbol.upper() in _MCX_SYMBOLS
+    OPEN  = _dt.time(9,  0) if is_mcx else _dt.time(9, 15)
+    CLOSE = _dt.time(23, 30) if is_mcx else _dt.time(15, 30)
+    step_min = max(1, step // 60)
     step_td  = _dt.timedelta(seconds=step)
 
     now = _dt.datetime.now(IST)
@@ -50,6 +64,17 @@ _BASE_PRICE = {
     "RELIANCE": 2900, "TCS": 3900, "HDFCBANK": 1700, "INFY": 1800,
     "ICICIBANK": 1200, "SBIN": 820, "TITAN": 3400, "APOLLOHOSP": 6200,
     "NESTLEIND": 2500, "TATAMOTORS": 980, "WIPRO": 540, "ITC": 470,
+    # MCX commodities — prices in INR per standard MCX unit (2025 levels)
+    # Gold: Rs/10g, Silver: Rs/kg, CrudeOil: Rs/bbl, NatGas: Rs/MMBtu, metals: Rs/kg
+    "GOLD": 92000, "GOLDM": 92000, "GOLDPETAL": 9200,
+    "SILVER": 97000, "SILVERM": 97000, "SILVERMIC": 97000,
+    "CRUDEOIL": 6200, "CRUDEOILM": 6200,
+    "NATURALGAS": 310,
+    "COPPER": 830, "COPPERM": 830,
+    "ZINC": 265, "ZINCP": 265,
+    "ALUMINIUM": 235, "ALUMINIM": 235,
+    "NICKEL": 1580,
+    "LEAD": 190,
 }
 
 
@@ -63,7 +88,7 @@ def generate_candles(symbol: str, interval: str, count: int = 600) -> list[dict]
     step = interval_seconds(interval)
 
     if interval in _INTRADAY:
-        timestamps = _market_bar_times(step, count)
+        timestamps = _market_bar_times(step, count, symbol)
     else:
         now = int(time.time())
         last_time = now - (now % step)

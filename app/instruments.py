@@ -155,6 +155,25 @@ INSTRUMENTS: list[Instrument] = [
     Instrument("ADANIGREEN",  "Adani Green Energy",         "NSE", "NSE_EQ|INE364U01010", "stock"),
     Instrument("ADANIPOWER",  "Adani Power",                "NSE", "NSE_EQ|INE814H01011", "stock"),
     Instrument("IDEA",        "Vodafone Idea",              "NSE", "NSE_EQ|INE669E01016", "stock"),
+
+    # ── MCX Commodities ────────────────────────────────────────────────
+    # Prices are in INR per standard MCX unit (Gold: Rs/10g, Silver: Rs/kg,
+    # CrudeOil: Rs/bbl, NatGas: Rs/MMBtu, base metals: Rs/kg).
+    # Instrument keys follow MCX_FO segment; mock fallback is always available.
+    Instrument("GOLD",        "Gold (MCX)",                 "MCX", "MCX_FO|GOLD",         "commodity"),
+    Instrument("GOLDM",       "Gold Mini (MCX)",            "MCX", "MCX_FO|GOLDM",        "commodity"),
+    Instrument("GOLDPETAL",   "Gold Petal (MCX)",           "MCX", "MCX_FO|GOLDPETAL",    "commodity"),
+    Instrument("SILVER",      "Silver (MCX)",               "MCX", "MCX_FO|SILVER",       "commodity"),
+    Instrument("SILVERM",     "Silver Mini (MCX)",          "MCX", "MCX_FO|SILVERM",      "commodity"),
+    Instrument("SILVERMIC",   "Silver Micro (MCX)",         "MCX", "MCX_FO|SILVERMIC",    "commodity"),
+    Instrument("CRUDEOIL",    "Crude Oil (MCX)",            "MCX", "MCX_FO|CRUDEOIL",     "commodity"),
+    Instrument("CRUDEOILM",   "Crude Oil Mini (MCX)",       "MCX", "MCX_FO|CRUDEOILM",   "commodity"),
+    Instrument("NATURALGAS",  "Natural Gas (MCX)",          "MCX", "MCX_FO|NATURALGAS",   "commodity"),
+    Instrument("COPPER",      "Copper (MCX)",               "MCX", "MCX_FO|COPPER",       "commodity"),
+    Instrument("ZINC",        "Zinc (MCX)",                 "MCX", "MCX_FO|ZINC",         "commodity"),
+    Instrument("ALUMINIUM",   "Aluminium (MCX)",            "MCX", "MCX_FO|ALUMINIUM",    "commodity"),
+    Instrument("NICKEL",      "Nickel (MCX)",               "MCX", "MCX_FO|NICKEL",       "commodity"),
+    Instrument("LEAD",        "Lead (MCX)",                 "MCX", "MCX_FO|LEAD",         "commodity"),
 ]
 
 _BY_SYMBOL = {i.symbol.upper(): i for i in INSTRUMENTS}
@@ -180,10 +199,11 @@ def search(query: str, limit: int = 40) -> list[Instrument]:
     """
     q = query.strip().upper()
     if not q:
-        # Default listing: show all indices first, then top equities
-        indices = [i for i in INSTRUMENTS if i.kind == "index"]
-        stocks  = [i for i in INSTRUMENTS if i.kind == "stock"]
-        return (indices + stocks)[:limit]
+        # Default listing: indices → commodities → top equities
+        indices     = [i for i in INSTRUMENTS if i.kind == "index"]
+        commodities = [i for i in INSTRUMENTS if i.kind == "commodity"]
+        stocks      = [i for i in INSTRUMENTS if i.kind == "stock"]
+        return (indices + commodities + stocks)[:limit]
 
     exact    = [i for i in INSTRUMENTS if i.symbol.upper() == q]
     starts   = [i for i in INSTRUMENTS if i.symbol.upper().startswith(q) and i not in exact]
