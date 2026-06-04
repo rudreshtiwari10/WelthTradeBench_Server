@@ -34,20 +34,25 @@ def _market_bar_times(step: int, count: int, symbol: str = "") -> list[int]:
 
     NSE  (default): Mon–Fri 9:15 AM – 3:30 PM IST
     MCX commodities: Mon–Fri 9:00 AM – 11:30 PM IST (extended evening session)
+
+    Bar boundaries are anchored to market open (09:15 IST for NSE, 09:00 IST for MCX)
+    so that timestamps match what Upstox returns for every interval (1m … 4H).
     """
     import datetime as _dt
 
-    IST = _dt.timezone(_dt.timedelta(seconds=_IST_OFFSET))
-    is_mcx = symbol.upper() in _MCX_SYMBOLS
-    OPEN  = _dt.time(9,  0) if is_mcx else _dt.time(9, 15)
-    CLOSE = _dt.time(23, 30) if is_mcx else _dt.time(15, 30)
-    step_min = max(1, step // 60)
-    step_td  = _dt.timedelta(seconds=step)
+    IST     = _dt.timezone(_dt.timedelta(seconds=_IST_OFFSET))
+    is_mcx  = symbol.upper() in _MCX_SYMBOLS
+    OPEN    = _dt.time(9,  0) if is_mcx else _dt.time(9, 15)
+    CLOSE   = _dt.time(23, 30) if is_mcx else _dt.time(15, 30)
+    step_td = _dt.timedelta(seconds=step)
 
-    now = _dt.datetime.now(IST)
-    mins = now.hour * 60 + now.minute
-    bar_min = (mins // step_min) * step_min
-    bar = now.replace(hour=bar_min // 60, minute=bar_min % 60, second=0, microsecond=0)
+    # Anchor: seconds from midnight UTC to market open.
+    # NSE: 09:15 IST = 03:45 UTC = 13500 s  |  MCX: 09:00 IST = 03:30 UTC = 12600 s
+    mopen_utc = (9 * 3600 - _IST_OFFSET) if is_mcx else (9 * 3600 + 15 * 60 - _IST_OFFSET)
+
+    now_ts  = int(_dt.datetime.now(_dt.timezone.utc).timestamp())
+    bar_ts  = (now_ts - mopen_utc) // step * step + mopen_utc
+    bar     = _dt.datetime.fromtimestamp(bar_ts, IST)
 
     result: list[int] = []
     while len(result) < count:
@@ -90,12 +95,12 @@ def generate_candles(symbol: str, interval: str, count: int = 600) -> list[dict]
     if interval in _INTRADAY:
         timestamps = _market_bar_times(step, count, symbol)
     else:
-        # Align to IST midnight (same formula as the frontend barTs / CandleTimer).
-        # UTC midnight alignment (now % step) is 5:30 h off from IST midnight,
-        # causing live-tick bars and historical bars to have different timestamps
-        # for 1D and 1W intervals.
+        # Align to 09:15 IST = 03:45 UTC = 13500 s from midnight UTC.
+        # Upstox daily (and weekly/monthly) candles are timestamped at market open,
+        # so using the same anchor keeps mock data consistent with live Upstox data.
+        MOPEN_UTC = 13500
         now = int(time.time())
-        last_time = (now + _IST_OFFSET) // step * step - _IST_OFFSET
+        last_time = (now - MOPEN_UTC) // step * step + MOPEN_UTC
         timestamps = [last_time - (count - 1 - i) * step for i in range(count)]
 
     price = _BASE_PRICE.get(symbol.upper(), 1000) * (0.85 + rnd.random() * 0.1)

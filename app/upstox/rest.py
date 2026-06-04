@@ -182,6 +182,58 @@ async def _fetch_historical(key: str, unit: str, value: int, to: str, frm: str) 
     return []              # unreachable; keeps type checker happy
 
 
+# ── Bar-boundary anchor ───────────────────────────────────────────────────────
+# 09:15 IST = 03:45 UTC = 13500 s from midnight UTC.
+# Upstox timestamps ALL candle intervals (1m through 1M) relative to this point,
+# so we use the same constant when aggregating 1-minute intraday bars up to any
+# requested interval — ensuring the result matches Upstox's own bar timestamps.
+_MOPEN_UTC = 13500
+
+# Seconds per unit (used when aggregating 1-minute intraday rows to higher TFs).
+_UNIT_STEP_SEC: dict[str, int] = {
+    "minutes": 60,
+    "hours":   3600,
+    "days":    86400,
+    "weeks":   604800,
+    "months":  2592000,   # ≈ 30 days; precise enough for current-bar aggregation
+}
+
+
+def _aggregate_1m_bars(bars_1m: dict[int, dict], unit: str, value: int) -> dict[int, dict]:
+    """Aggregate 1-minute bars up to any higher timeframe.
+
+    Uses the same MOPEN_UTC anchor as the frontend barTs() formula so that
+    the resulting bucket timestamps match Upstox historical candle timestamps.
+
+    bucket = floor((ts - MOPEN_UTC) / step) * step + MOPEN_UTC
+    """
+    if not bars_1m:
+        return {}
+
+    step = _UNIT_STEP_SEC.get(unit, 86400) * value
+    aggregated: dict[int, dict] = {}
+
+    for ts, bar in sorted(bars_1m.items()):
+        bucket = (ts - _MOPEN_UTC) // step * step + _MOPEN_UTC
+        if bucket not in aggregated:
+            aggregated[bucket] = {
+                "time":   bucket,
+                "open":   bar["open"],
+                "high":   bar["high"],
+                "low":    bar["low"],
+                "close":  bar["close"],
+                "volume": bar["volume"],
+            }
+        else:
+            a = aggregated[bucket]
+            a["high"]   = max(a["high"], bar["high"])
+            a["low"]    = min(a["low"],  bar["low"])
+            a["close"]  = bar["close"]      # last 1m close = current bar's close
+            a["volume"] += bar["volume"]
+
+    return aggregated
+
+
 async def historical_candles(inst: Instrument, interval: str, count: int) -> list[dict]:
     unit, value = _UNIT_MAP.get(interval, ("days", 1))
     key = urllib.parse.quote(inst.instrument_key, safe="")
@@ -224,20 +276,46 @@ async def historical_candles(inst: Instrument, interval: str, count: int) -> lis
             f"{inst.symbol} {interval}.  Sample row: {sample!r}"
         )
 
-    # ── Intraday supplement (today's live session) ────────────────────────
-    # The historical endpoint only returns COMPLETED prior sessions for intraday
-    # intervals.  Today's in-progress bars need the separate intraday endpoint.
-    if interval in _NSE_BARS_PER_DAY:
-        intra_url = f"{API_BASE}/v3/historical-candle/intraday/{key}/{unit}/{value}"
+    # ── Intraday supplement (today's live/ongoing session) ───────────────
+    # The Upstox historical endpoint only returns COMPLETED prior sessions.
+    # Today's in-progress bar must come from the intraday endpoint.
+    #
+    # CRITICAL LIMITATION: the Upstox intraday endpoint only accepts "minutes"
+    # as the unit.  Passing "hours/4" or "days/1" returns 400 / empty data.
+    # Fix: for all non-minute intervals we fetch 1-minute intraday bars and
+    # aggregate them up to the requested interval with _aggregate_1m_bars(),
+    # using the same MOPEN_UTC anchor as the frontend's barTs() function so
+    # bucket timestamps match Upstox's historical candle timestamps exactly.
+    _NEEDS_INTRADAY = set(_NSE_BARS_PER_DAY) | {"1D", "1W", "1M"}
+    if interval in _NEEDS_INTRADAY:
+        # Always fetch 1-minute intraday data; aggregate if the interval is
+        # coarser than 1 minute.
+        intra_url = f"{API_BASE}/v3/historical-candle/intraday/{key}/minutes/1"
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 intra_resp = await client.get(intra_url, headers=_headers())
+
             if intra_resp.is_success:
                 intra_rows = intra_resp.json().get("data", {}).get("candles", []) or []
-                bars.update(_parse_rows(intra_rows))
+                raw_1m = _parse_rows(intra_rows)
+
+                if unit == "minutes" and value == 1:
+                    # 1-minute chart: use as-is, no aggregation needed.
+                    bars.update(raw_1m)
+                elif unit == "minutes":
+                    # e.g. 3m / 5m / 15m / 30m: aggregate 1m → Nm buckets.
+                    bars.update(_aggregate_1m_bars(raw_1m, "minutes", value))
+                else:
+                    # hours / days / weeks / months: aggregate 1m → target TF.
+                    agg = _aggregate_1m_bars(raw_1m, unit, value)
+                    bars.update(agg)
+                    print(
+                        f"[history] {inst.symbol} {interval}: aggregated "
+                        f"{len(raw_1m)} intraday 1m bars → {len(agg)} bar(s)"
+                    )
             else:
                 print(
-                    f"[history] Intraday endpoint returned {intra_resp.status_code} "
+                    f"[history] Intraday 1m endpoint returned {intra_resp.status_code} "
                     f"for {inst.symbol} {interval}"
                 )
         except Exception as exc:  # noqa: BLE001

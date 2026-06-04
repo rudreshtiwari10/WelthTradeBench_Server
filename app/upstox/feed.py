@@ -287,16 +287,34 @@ class FeedHub:
 
         return None
 
+    @staticmethod
+    def _extract_ts(payload: dict) -> int | None:
+        """Extract ltt (last trade time) from ltpc payload as Unix seconds.
+
+        Upstox sends ltt as milliseconds since epoch. We convert to seconds so it
+        matches the ts format used everywhere else in the tick pipeline.
+        Falls back to None when ltt is absent (e.g. full-feed mode), in which case
+        the caller should use time.time() as a fallback.
+        """
+        try:
+            ltt = (payload.get("ltpc") or {}).get("ltt")
+            if ltt is not None:
+                return int(int(ltt) / 1000)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
     def _on_upstox_message(self, message: Any) -> None:
         """Runs on the streamer thread. Decode tick and hand off to the event loop."""
         import time as _t
         try:
             feeds = (message or {}).get("feeds", {})
-            ts = int(_t.time())
+            wall_ts = int(_t.time())  # fallback when ltt is absent
             for key, payload in feeds.items():
                 ltp = self._extract_ltp(payload or {})
                 if ltp is None:
                     continue
+                ts = self._extract_ts(payload or {}) or wall_ts
 
                 # ── Static instrument lookup (NSE/BSE indices + equities) ──
                 inst = by_key(key)
