@@ -90,8 +90,12 @@ def generate_candles(symbol: str, interval: str, count: int = 600) -> list[dict]
     if interval in _INTRADAY:
         timestamps = _market_bar_times(step, count, symbol)
     else:
+        # Align to IST midnight (same formula as the frontend barTs / CandleTimer).
+        # UTC midnight alignment (now % step) is 5:30 h off from IST midnight,
+        # causing live-tick bars and historical bars to have different timestamps
+        # for 1D and 1W intervals.
         now = int(time.time())
-        last_time = now - (now % step)
+        last_time = (now + _IST_OFFSET) // step * step - _IST_OFFSET
         timestamps = [last_time - (count - 1 - i) * step for i in range(count)]
 
     price = _BASE_PRICE.get(symbol.upper(), 1000) * (0.85 + rnd.random() * 0.1)
