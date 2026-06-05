@@ -46,6 +46,11 @@ _TRACKED = {
     "LEAD",
 }
 
+# Sorted longest-first so prefix matching always picks the most specific symbol.
+# Without this, "GOLDM24OCTFUT".startswith("GOLD") fires before "GOLDM" is checked
+# because _TRACKED is an unordered set.
+_TRACKED_SORTED = sorted(_TRACKED, key=len, reverse=True)
+
 # Upstox CDN — no auth required, updated every trading day before market open.
 _CSV_URL  = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 _JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
@@ -135,12 +140,15 @@ def _match_name(raw_name: str) -> Optional[str]:
     """Map a raw instrument name / trading-symbol to one of our tracked symbols.
 
     Handles exact matches (e.g. "GOLD") and prefix matches on trading symbols
-    (e.g. "GOLDOCT24FUT" → "GOLD").
+    (e.g. "GOLDOCT24FUT" → "GOLD", "GOLDM24OCTFUT" → "GOLDM").
+    _TRACKED_SORTED is checked longest-first so "GOLDPETAL" is matched before
+    "GOLDM" which is matched before "GOLD", preventing short prefixes from
+    swallowing longer, more specific symbols.
     """
     name = raw_name.strip().upper()
     if name in _TRACKED:
         return name
-    for sym in _TRACKED:
+    for sym in _TRACKED_SORTED:
         if name.startswith(sym):
             return sym
     return None
@@ -155,7 +163,7 @@ def _parse_csv(raw: bytes) -> tuple[dict[str, str], dict[str, str]]:
 
     for row in reader:
         exchange = (row.get("exchange") or row.get("Exchange") or "").strip().upper()
-        if exchange != "MCX":
+        if exchange not in ("MCX", "MCX_FO"):
             continue
         inst_type = (
             row.get("instrument_type") or row.get("InstrumentType") or ""
@@ -196,7 +204,7 @@ def _parse_json(raw: bytes) -> tuple[dict[str, str], dict[str, str]]:
 
     for inst in instruments:
         exchange = (inst.get("exchange") or "").strip().upper()
-        if exchange != "MCX":
+        if exchange not in ("MCX", "MCX_FO"):
             continue
         inst_type = (
             inst.get("instrument_type") or inst.get("instrumentType") or ""

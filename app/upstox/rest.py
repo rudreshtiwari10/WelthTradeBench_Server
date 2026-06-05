@@ -188,12 +188,14 @@ async def _fetch_historical(key: str, unit: str, value: int, to: str, frm: str) 
     return []              # unreachable; keeps type checker happy
 
 
-# ── Bar-boundary anchor ───────────────────────────────────────────────────────
-# 09:15 IST = 03:45 UTC = 13500 s from midnight UTC.
-# Upstox timestamps ALL candle intervals (1m through 1M) relative to this point,
-# so we use the same constant when aggregating 1-minute intraday bars up to any
-# requested interval — ensuring the result matches Upstox's own bar timestamps.
-_MOPEN_UTC = 13500
+# ── Bar-boundary anchors ──────────────────────────────────────────────────────
+# Upstox timestamps bars relative to each exchange's market-open time (IST).
+#   NSE/BSE equity & F&O : 09:15 IST = 03:45 UTC = 13500 s from midnight UTC
+#   MCX commodity futures : 09:00 IST = 03:30 UTC = 12600 s from midnight UTC
+# Using the wrong anchor shifts every bucket by 900 s, causing live ticks to land
+# in a different bar than the historical data — producing a duplicate daily candle.
+_MOPEN_UTC     = 13500   # NSE / BSE (default)
+_MCX_MOPEN_UTC = 12600   # MCX commodity futures
 
 # Seconds per unit (used when aggregating 1-minute intraday rows to higher TFs).
 _UNIT_STEP_SEC: dict[str, int] = {
@@ -205,14 +207,22 @@ _UNIT_STEP_SEC: dict[str, int] = {
 }
 
 
-def _aggregate_bars(source_bars: dict[int, dict], target_unit: str, target_value: int) -> dict[int, dict]:
+def _aggregate_bars(
+    source_bars: dict[int, dict],
+    target_unit: str,
+    target_value: int,
+    mopen_utc: int = _MOPEN_UTC,
+) -> dict[int, dict]:
     """Aggregate any lower-timeframe bars into higher-timeframe OHLCV buckets.
 
     Works for any source interval (1m → 15m, 1H → 4H, etc.).  Uses the same
-    MOPEN_UTC anchor as the frontend barTs() formula so bucket timestamps are
+    mopen_utc anchor as the frontend barTs() formula so bucket timestamps are
     byte-for-byte identical to what Upstox puts in its historical candles.
 
-    bucket = floor((ts - MOPEN_UTC) / step) * step + MOPEN_UTC
+    Pass mopen_utc=_MCX_MOPEN_UTC (12600) for MCX commodity instruments so
+    buckets are anchored to 09:00 IST instead of the NSE default of 09:15 IST.
+
+    bucket = floor((ts - mopen_utc) / step) * step + mopen_utc
     """
     if not source_bars:
         return {}
@@ -221,7 +231,7 @@ def _aggregate_bars(source_bars: dict[int, dict], target_unit: str, target_value
     aggregated: dict[int, dict] = {}
 
     for ts, bar in sorted(source_bars.items()):
-        bucket = (ts - _MOPEN_UTC) // step * step + _MOPEN_UTC
+        bucket = (ts - mopen_utc) // step * step + mopen_utc
         if bucket not in aggregated:
             aggregated[bucket] = {
                 "time":   bucket,
@@ -245,6 +255,8 @@ async def historical_candles(inst: Instrument, interval: str, count: int) -> lis
     unit, value = _UNIT_MAP.get(interval, ("days", 1))
     key = urllib.parse.quote(inst.instrument_key, safe="")
     frm, to = _from_to(interval, count)
+    # MCX commodity futures open at 09:00 IST; everything else at 09:15 IST.
+    mopen = _MCX_MOPEN_UTC if inst.kind == "commodity" else _MOPEN_UTC
 
     # ── Historical bars (completed sessions) ─────────────────────────────
     # Two attempts: full range first, then half range as a safety net.
@@ -281,7 +293,7 @@ async def historical_candles(inst: Instrument, interval: str, count: int) -> lis
             half_frm = (to_dt.date() - timedelta(days=max(5, (to_dt.date() - datetime.fromisoformat(frm).date()).days // 2))).isoformat()
             rows_1h = await _fetch_historical(key, "hours", 1, to, half_frm)
         if rows_1h:
-            bars = _aggregate_bars(_parse_rows(rows_1h), unit, value)
+            bars = _aggregate_bars(_parse_rows(rows_1h), unit, value, mopen)
             print(f"[history] {inst.symbol} {interval}: {len(rows_1h)} 1H rows → {len(bars)} bars")
         else:
             print(f"[history] {inst.symbol} {interval}: all historical fetches returned empty")
@@ -319,7 +331,7 @@ async def historical_candles(inst: Instrument, interval: str, count: int) -> lis
                     if unit == "minutes" and value == 1:
                         bars.update(raw_1m)           # 1m: no aggregation needed
                     else:
-                        agg = _aggregate_bars(raw_1m, unit, value)
+                        agg = _aggregate_bars(raw_1m, unit, value, mopen)
                         bars.update(agg)
                         print(f"[history] {inst.symbol} {interval}: {len(raw_1m)} 1m intraday bars → {len(agg)} bar(s)")
             else:

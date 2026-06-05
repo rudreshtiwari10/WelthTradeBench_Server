@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
 from .instruments import Instrument, by_symbol, search
-from .mcx_instruments import refresh as _mcx_refresh
+from .mcx_instruments import refresh as _mcx_refresh, active_key as _mcx_active_key
 from .mock.generator import (
     generate_candles, generate_option_candles,
     generate_futures_candles, option_premium_py,
@@ -196,13 +196,32 @@ async def history(
     if not candles:
         inst = by_symbol(symbol)
         if inst and hub.mode == "upstox":
-            try:
-                candles = await rest.historical_candles(inst, interval, count)
-                source = "upstox"
-            except Exception as exc:  # noqa: BLE001
-                reason = str(exc)
-                print(f"[history] Upstox fetch failed ({symbol} {interval}): {reason}")
-                source_warning = f"Upstox data unavailable for {symbol} {interval}: {reason}"
+            # MCX instruments are stored with placeholder keys (e.g. "MCX_FO|GOLD").
+            # The real front-month contract key must be resolved before calling Upstox.
+            if inst.kind == "commodity":
+                real_key = _mcx_active_key(symbol)
+                if not real_key:
+                    try:
+                        await _mcx_refresh()
+                        real_key = _mcx_active_key(symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[history] MCX key resolution failed for {symbol}: {exc}")
+                if real_key:
+                    inst = Instrument(
+                        symbol=inst.symbol, name=inst.name, exchange=inst.exchange,
+                        instrument_key=real_key, kind=inst.kind,
+                    )
+                else:
+                    print(f"[history] No active MCX contract for {symbol} — falling back to mock")
+                    inst = None  # triggers mock fallback below
+            if inst:
+                try:
+                    candles = await rest.historical_candles(inst, interval, count)
+                    source = "upstox"
+                except Exception as exc:  # noqa: BLE001
+                    reason = str(exc)
+                    print(f"[history] Upstox fetch failed ({symbol} {interval}): {reason}")
+                    source_warning = f"Upstox data unavailable for {symbol} {interval}: {reason}"
         if not candles:
             candles = generate_candles(symbol, interval, count)
         if info is None:
@@ -636,6 +655,211 @@ async def derivatives_futures(underlying: str) -> dict:
             })
 
     return {"source": hub.mode, "underlying": underlying, "futures": futures}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BACKTEST  (/api/backtest/*)
+# Isolated from all live-mode paths.  Uses Yahoo Finance as the data source
+# so users get maximum historical depth (up to 20 years on daily) without
+# consuming Upstox API quota.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Symbol → Yahoo Finance ticker.  NSE equities not listed here fall back to
+# the SYMBOL.NS convention automatically.
+_YF_TICKER_MAP: dict[str, str] = {
+    # NSE indices
+    "NIFTY":          "^NSEI",
+    "BANKNIFTY":      "^NSEBANK",
+    "SENSEX":         "^BSESN",
+    "FINNIFTY":       "^CNXFIN",
+    "MIDCPNIFTY":     "NIFTY_MID_SELECT.NS",
+    "NIFTYNXT50":     "^NSMIDCP",
+    "NIFTY100":       "^CNX100",
+    "NIFTY200":       "^CNX200",
+    "NIFTY500":       "^CNX500",
+    "NIFTYMIDCAP150": "^CNXMIDCAP",
+    "NIFTYIT":        "^CNXIT",
+    "NIFTYPHARMA":    "^CNXPHARMA",
+    "VIXNSE":         "^INDIAVIX",
+    "BANKEX":         "BANKEX.BO",
+    # MCX commodity futures — international benchmarks (prices in USD, not INR)
+    "GOLD":       "GC=F",
+    "GOLDM":      "GC=F",
+    "GOLDPETAL":  "GC=F",
+    "SILVER":     "SI=F",
+    "SILVERM":    "SI=F",
+    "SILVERMIC":  "SI=F",
+    "CRUDEOIL":   "CL=F",
+    "CRUDEOILM":  "CL=F",
+    "NATURALGAS": "NG=F",
+    "COPPER":     "HG=F",
+    "ALUMINIUM":  "ALI=F",
+    "ZINC":       "ZINC=F",
+    "NICKEL":     "NI=F",
+    "LEAD":       "PB=F",
+}
+
+# Our timeframe codes → Yahoo Finance interval strings (closest available).
+_YF_INTERVAL_MAP: dict[str, str] = {
+    "1m":  "1m",
+    "3m":  "5m",   # Yahoo has no 3m; 5m is the closest
+    "5m":  "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1H":  "60m",
+    "2H":  "60m",  # fetch 1H bars, aggregate on our side
+    "4H":  "60m",  # fetch 1H bars, aggregate on our side
+    "1D":  "1d",
+    "1W":  "1wk",
+    "1M":  "1mo",
+}
+
+# Maximum historical lookback Yahoo Finance reliably supports per interval.
+_YF_MAX_DAYS: dict[str, int] = {
+    "1m":  7,      # Yahoo hard limit: 7 days for 1-minute data
+    "3m":  60,
+    "5m":  60,
+    "15m": 60,
+    "30m": 60,
+    "1H":  730,    # 2 years
+    "2H":  730,
+    "4H":  730,
+    "1D":  3650,   # 10 years
+    "1W":  7300,   # 20 years
+    "1M":  7300,
+}
+
+
+@app.get("/api/backtest/history")
+async def backtest_history(symbol: str, interval: str = "1D") -> dict:
+    """Historical data for Backtest Mode.
+
+    Priority 1 — Yahoo Finance: returns maximum depth (up to 20 years on 1D/1W/1M,
+    60 days on intraday, etc.) without consuming Upstox quota.
+
+    Priority 2 — Upstox / mock fallback: if Yahoo Finance is unavailable for any
+    reason (rate-limit, unknown ticker, network error, empty response), the endpoint
+    transparently falls back to the existing /api/history logic with count=2000 so
+    the chart always receives data.  A source_warning is added to let the frontend
+    toast the user about which source was actually used.
+    """
+    import httpx as _httpx
+    import time as _time
+
+    sym_upper   = symbol.upper()
+    ticker      = _YF_TICKER_MAP.get(sym_upper) or f"{sym_upper}.NS"
+    yf_interval = _YF_INTERVAL_MAP.get(interval, "1d")
+    days        = _YF_MAX_DAYS.get(interval, 3650)
+
+    now     = int(_time.time())
+    period1 = now - days * 86400
+    qs      = f"period1={period1}&period2={now}&interval={yf_interval}"
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+    }
+
+    # ── Priority 1: Yahoo Finance ────────────────────────────────────────────
+    yahoo_fail_reason: str | None = None
+    try:
+        r: "_httpx.Response | None" = None
+        for host in ("query1", "query2"):
+            _url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}?{qs}"
+            async with _httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                _r = await client.get(_url, headers=req_headers)
+            if _r.is_success:
+                r = _r
+                break
+            r = _r
+
+        if r is None or not r.is_success:
+            yahoo_fail_reason = f"HTTP {r.status_code if r else 0}"
+        else:
+            chart  = (r.json().get("chart") or {})
+            yf_err = chart.get("error")
+            if yf_err:
+                yahoo_fail_reason = yf_err.get("description", "symbol not found")
+            else:
+                result = (chart.get("result") or [None])[0]
+                if not result:
+                    yahoo_fail_reason = "empty result"
+                else:
+                    timestamps = result.get("timestamp") or []
+                    quote      = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+                    opens      = quote.get("open",   [])
+                    highs      = quote.get("high",   [])
+                    lows       = quote.get("low",    [])
+                    closes     = quote.get("close",  [])
+                    volumes    = quote.get("volume", [])
+
+                    candles: list[dict] = []
+                    for i, ts in enumerate(timestamps):
+                        try:
+                            o = opens[i]; h = highs[i]; l = lows[i]; c = closes[i]
+                            if any(v is None for v in (o, h, l, c)):
+                                continue
+                            candles.append({
+                                "time":   int(ts),
+                                "open":   round(float(o), 2),
+                                "high":   round(float(h), 2),
+                                "low":    round(float(l), 2),
+                                "close":  round(float(c), 2),
+                                "volume": int(volumes[i]) if i < len(volumes) and volumes[i] is not None else 0,
+                            })
+                        except (TypeError, ValueError, IndexError):
+                            continue
+
+                    if not candles:
+                        yahoo_fail_reason = "0 valid bars parsed"
+                    else:
+                        # 2H / 4H: Yahoo only supplies 60m — aggregate here.
+                        if interval in ("2H", "4H"):
+                            from .upstox.rest import _aggregate_bars, _MCX_MOPEN_UTC, _MOPEN_UTC
+                            mopen  = _MCX_MOPEN_UTC if sym_upper in _MCX_COMMODITIES else _MOPEN_UTC
+                            value  = 2 if interval == "2H" else 4
+                            agg    = _aggregate_bars({c["time"]: c for c in candles}, "hours", value, mopen)
+                            candles = sorted(agg.values(), key=lambda x: x["time"])
+
+                        source_warning: str | None = None
+                        if sym_upper in _MCX_COMMODITIES:
+                            source_warning = (
+                                "Backtest prices sourced from international USD futures (Yahoo Finance). "
+                                "Pattern shapes are accurate; absolute INR values differ from MCX."
+                            )
+
+                        inst = by_symbol(symbol)
+                        info = (
+                            {"symbol": inst.symbol, "name": inst.name,
+                             "exchange": inst.exchange, "kind": inst.kind}
+                            if inst else
+                            {"symbol": symbol, "name": symbol,
+                             "exchange": "Yahoo Finance", "kind": "stock"}
+                        )
+                        return {
+                            "symbol":         symbol,
+                            "interval":       interval,
+                            "source":         "yahoo",
+                            "source_warning": source_warning,
+                            "info":           info,
+                            "candles":        candles,
+                        }
+
+    except Exception as exc:  # noqa: BLE001
+        yahoo_fail_reason = str(exc)
+
+    # ── Priority 2: Upstox / mock fallback ──────────────────────────────────
+    print(f"[backtest] Yahoo Finance failed for {symbol} {interval} ({yahoo_fail_reason}) "
+          f"— falling back to Upstox/mock")
+
+    fallback = await history(symbol=symbol, interval=interval, count=2000)
+
+    src_label = "Upstox" if fallback.get("source") == "upstox" else "mock data"
+    existing_warn = (fallback.get("source_warning") or "").strip()
+    fallback["source_warning"] = (
+        f"Yahoo Finance unavailable ({yahoo_fail_reason}); using {src_label}. "
+        + existing_warn
+    ).rstrip()
+    return fallback
 
 
 @app.get("/api/broker/option-chain")
