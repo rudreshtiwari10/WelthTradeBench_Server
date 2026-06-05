@@ -67,6 +67,17 @@ async def health() -> dict:
     return {"status": "ok", "mode": hub.mode}
 
 
+@app.get("/api/time")
+async def server_time() -> dict:
+    """Return the server's current Unix time in milliseconds.
+
+    Clients use this for NTP-style clock-skew correction so candle boundaries
+    are computed from accurate market time rather than the user's local clock.
+    """
+    import time as _time
+    return {"serverTime": int(_time.time() * 1000)}
+
+
 @app.post("/api/mcx/refresh")
 async def mcx_refresh() -> dict:
     """Force-refresh the MCX active contract key cache from Upstox CDN.
