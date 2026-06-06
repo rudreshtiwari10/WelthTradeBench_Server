@@ -15,8 +15,10 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
+from .database import connect_db, close_db
 from .instruments import Instrument, by_symbol, search
 from .mcx_instruments import refresh as _mcx_refresh, active_key as _mcx_active_key
+from .routers import auth as _auth_router, layouts as _layouts_router, drawings as _drawings_router, admin as _admin_router
 from .mock.generator import (
     generate_candles, generate_option_candles,
     generate_futures_candles, option_premium_py,
@@ -36,7 +38,7 @@ class PlaceOrderBody(BaseModel):
     product: str = "D"             # "D" = NRML, "I" = MIS
     trigger_price: float = 0.0
 
-app = FastAPI(title="Tradomate API", version="0.2.0")
+app = FastAPI(title="Tradomate API", version="0.3.0")
 
 # CORS: CLIENT_URL may be comma-separated (e.g. "http://localhost:5173,https://app.vercel.app").
 # Set CORS_ORIGINS env var to override entirely.
@@ -51,15 +53,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(_auth_router.router)
+app.include_router(_layouts_router.router)
+app.include_router(_drawings_router.router)
+app.include_router(_admin_router.router)
+
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Pre-fetch MCX active contract keys so the first commodity subscription
-    doesn't have to wait for the CDN download."""
+    """Connect to MongoDB and pre-fetch MCX active contract keys."""
+    try:
+        await connect_db()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] MongoDB connection failed: {exc}")
     try:
         await _mcx_refresh()
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] MCX instrument prefetch failed (will retry on first subscribe): {exc}")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await close_db()
 
 
 @app.get("/api/health")
