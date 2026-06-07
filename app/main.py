@@ -11,6 +11,7 @@ import os
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
@@ -19,6 +20,7 @@ from .database import connect_db, close_db
 from .instruments import Instrument, by_symbol, search
 from .mcx_instruments import refresh as _mcx_refresh, active_key as _mcx_active_key
 from .routers import auth as _auth_router, layouts as _layouts_router, drawings as _drawings_router, admin as _admin_router
+from .historical.router import router as _historical_router
 from .mock.generator import (
     generate_candles, generate_option_candles,
     generate_futures_candles, option_premium_py,
@@ -45,6 +47,7 @@ app = FastAPI(title="Tradomate API", version="0.3.0")
 _raw_cors = os.getenv("CORS_ORIGINS", CLIENT_URL)
 _cors_origins = [o.strip() for o in _raw_cors.split(",") if o.strip()] or [CLIENT_URL]
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -57,6 +60,7 @@ app.include_router(_auth_router.router)
 app.include_router(_layouts_router.router)
 app.include_router(_drawings_router.router)
 app.include_router(_admin_router.router)
+app.include_router(_historical_router)
 
 
 @app.on_event("startup")
@@ -70,10 +74,20 @@ async def _startup() -> None:
         await _mcx_refresh()
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] MCX instrument prefetch failed (will retry on first subscribe): {exc}")
+    try:
+        from .historical.scheduler import start_scheduler
+        start_scheduler()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] Historical EOD scheduler failed to start: {exc}")
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    try:
+        from .historical.scheduler import stop_scheduler
+        stop_scheduler()
+    except Exception:  # noqa: BLE001
+        pass
     await close_db()
 
 
@@ -764,6 +778,47 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
     ticker      = _YF_TICKER_MAP.get(sym_upper) or f"{sym_upper}.NS"
     yf_interval = _YF_INTERVAL_MAP.get(interval, "1d")
     days        = _YF_MAX_DAYS.get(interval, 3650)
+
+    # ── Priority 0: Historical store (populated by the backfill pipeline) ───
+    # Per-timeframe limits: 0 = no limit (used for low-frequency TFs with small counts).
+    # For intraday TFs we cap at a generous window to keep response times <3s.
+    _HIST_LIMIT: dict[str, int] = {
+        "1m": 15000, "3m": 15000,           # ~20 trading days
+        "5m": 20000, "15m": 20000,          # ~67 / ~200 trading days
+        "30m": 15000,                        # ~300 trading days
+        "1H": 0, "2H": 0, "4H": 0,         # all (hundreds of bars)
+        "1D": 0, "1W": 0, "1M": 0,         # all (small counts)
+    }
+    try:
+        from .historical.store import has_sufficient_data, query_candles as _hist_query
+        if await has_sufficient_data(sym_upper, interval, min_candles=200):
+            _lim = _HIST_LIMIT.get(interval, 10000)
+            # newest_first=True + limit → fetches most-recent N bars then reverses to asc order.
+            # limit=0 → returns all bars ascending (used for low-frequency timeframes).
+            stored = await _hist_query(
+                sym_upper, interval,
+                limit=_lim,
+                newest_first=(_lim > 0),
+            )
+            if stored:
+                inst = by_symbol(symbol)
+                _info = (
+                    {"symbol": inst.symbol, "name": inst.name,
+                     "exchange": inst.exchange, "kind": inst.kind}
+                    if inst else
+                    {"symbol": symbol, "name": symbol,
+                     "exchange": "Historical Store", "kind": "stock"}
+                )
+                return {
+                    "symbol":         symbol,
+                    "interval":       interval,
+                    "source":         "historical_store",
+                    "source_warning": None,
+                    "info":           _info,
+                    "candles":        stored,
+                }
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[backtest] historical store check failed: {_exc}")
 
     # ── Priority 1: yfinance ─────────────────────────────────────────────────
     yahoo_fail_reason: str | None = None

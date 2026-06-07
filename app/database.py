@@ -20,6 +20,15 @@ async def connect_db() -> None:
     await db.users.create_index("email", unique=True)
     await db.layouts.create_index([("user_id", 1), ("id", 1)], unique=True)
     await db.drawings.create_index([("user_id", 1), ("key", 1)], unique=True)
+    # Historical data pipeline collections
+    await db.historical_candles.create_index(
+        [("symbol", 1), ("timeframe", 1), ("timestamp", 1)],
+        unique=True, name="idx_hist_symbol_tf_ts", background=True,
+    )
+    await db.historical_sync_state.create_index(
+        [("symbol", 1), ("timeframe", 1)],
+        unique=True, name="idx_hist_sync_symbol_tf", background=True,
+    )
 
 
 async def close_db() -> None:
