@@ -42,6 +42,7 @@ async def _eod_fill() -> None:
         return
 
     print(f"[eod_fill] Updating {len(states)} symbol/timeframe pairs")
+    updated_pairs: list[tuple[str, str]] = []
     for state in states:
         sym = state.get("symbol")
         tf = state.get("timeframe")
@@ -54,9 +55,20 @@ async def _eod_fill() -> None:
             result = await incremental_sync(inst, tf)
             if result.get("upserted", 0):
                 print(f"[eod_fill] {sym}/{tf}: +{result['upserted']} candles")
+                updated_pairs.append((sym, tf))
         except Exception as exc:
             print(f"[eod_fill] {sym}/{tf}: {exc}")
         await asyncio.sleep(0.5)
+
+    # Evict gzip cache for pairs that got new candles, so next chart open re-builds.
+    if updated_pairs:
+        try:
+            from ..main import _BACKTEST_CACHE
+            for pair in updated_pairs:
+                _BACKTEST_CACHE.pop(pair, None)
+            print(f"[eod_fill] Evicted backtest cache for {len(updated_pairs)} pairs")
+        except Exception:
+            pass
 
     print("[eod_fill] Done")
 

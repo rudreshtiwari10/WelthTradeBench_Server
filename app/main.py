@@ -12,7 +12,7 @@ import os
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import ORJSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
@@ -40,7 +40,7 @@ class PlaceOrderBody(BaseModel):
     product: str = "D"             # "D" = NRML, "I" = MIS
     trigger_price: float = 0.0
 
-app = FastAPI(title="Tradomate API", version="0.3.0")
+app = FastAPI(title="Tradomate API", version="0.3.0", default_response_class=ORJSONResponse)
 
 # CORS: CLIENT_URL may be comma-separated (e.g. "http://localhost:5173,https://app.vercel.app").
 # Set CORS_ORIGINS env var to override entirely.
@@ -743,6 +743,15 @@ _YF_INTERVAL_MAP: dict[str, str] = {
     "1M":  "1mo",
 }
 
+# In-memory candle cache for the backtest endpoint.
+# Key: (symbol_upper, timeframe)  Value: (gzip_bytes, cached_at_epoch)
+# TTL: 1 hour.  After the first (slow) MongoDB+gzip build, subsequent calls serve
+# pre-gzipped bytes directly with no serialisation or compression overhead.
+import gzip as _gzip_mod
+import time as _time_mod
+_BACKTEST_CACHE: dict[tuple[str, str], tuple[bytes, float]] = {}
+_BACKTEST_CACHE_TTL: float = 3600.0
+
 # Maximum historical lookback Yahoo Finance reliably supports per interval.
 _YF_MAX_DAYS: dict[str, int] = {
     "1m":  7,      # Yahoo hard limit: 7 days for 1-minute data
@@ -780,26 +789,23 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
     days        = _YF_MAX_DAYS.get(interval, 3650)
 
     # ── Priority 0: Historical store (populated by the backfill pipeline) ───
-    # Per-timeframe limits: 0 = no limit (used for low-frequency TFs with small counts).
-    # For intraday TFs we cap at a generous window to keep response times <3s.
-    _HIST_LIMIT: dict[str, int] = {
-        "1m": 15000, "3m": 15000,           # ~20 trading days
-        "5m": 20000, "15m": 20000,          # ~67 / ~200 trading days
-        "30m": 15000,                        # ~300 trading days
-        "1H": 0, "2H": 0, "4H": 0,         # all (hundreds of bars)
-        "1D": 0, "1W": 0, "1M": 0,         # all (small counts)
-    }
     try:
+        from fastapi.responses import Response as _Resp
+        import orjson as _orjson
         from .historical.store import has_sufficient_data, query_candles as _hist_query
         if await has_sufficient_data(sym_upper, interval, min_candles=200):
-            _lim = _HIST_LIMIT.get(interval, 10000)
-            # newest_first=True + limit → fetches most-recent N bars then reverses to asc order.
-            # limit=0 → returns all bars ascending (used for low-frequency timeframes).
-            stored = await _hist_query(
-                sym_upper, interval,
-                limit=_lim,
-                newest_first=(_lim > 0),
-            )
+            _cache_key = (sym_upper, interval)
+            _cached = _BACKTEST_CACHE.get(_cache_key)
+            if _cached and (_time_mod.time() - _cached[1]) < _BACKTEST_CACHE_TTL:
+                # Serve pre-gzipped bytes directly — zero serialisation overhead.
+                return _Resp(
+                    content=_cached[0],
+                    media_type="application/json",
+                    headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+                )
+            # Cache miss: read MongoDB, build payload, gzip once, cache bytes.
+            print(f"[backtest] cache miss {sym_upper}/{interval} — loading from MongoDB")
+            stored = await _hist_query(sym_upper, interval, limit=0)
             if stored:
                 inst = by_symbol(symbol)
                 _info = (
@@ -809,14 +815,23 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
                     {"symbol": symbol, "name": symbol,
                      "exchange": "Historical Store", "kind": "stock"}
                 )
-                return {
+                _payload = _orjson.dumps({
                     "symbol":         symbol,
                     "interval":       interval,
                     "source":         "historical_store",
                     "source_warning": None,
                     "info":           _info,
                     "candles":        stored,
-                }
+                })
+                _gz = _gzip_mod.compress(_payload, compresslevel=1)
+                _BACKTEST_CACHE[_cache_key] = (_gz, _time_mod.time())
+                print(f"[backtest] cached {len(stored):,} candles for {sym_upper}/{interval} "
+                      f"({len(_gz)//1024}KB gzipped)")
+                return _Resp(
+                    content=_gz,
+                    media_type="application/json",
+                    headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+                )
     except Exception as _exc:  # noqa: BLE001
         print(f"[backtest] historical store check failed: {_exc}")
 
