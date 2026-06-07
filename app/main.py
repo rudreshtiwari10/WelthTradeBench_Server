@@ -12,7 +12,7 @@ import os
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import ORJSONResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
@@ -40,7 +40,7 @@ class PlaceOrderBody(BaseModel):
     product: str = "D"             # "D" = NRML, "I" = MIS
     trigger_price: float = 0.0
 
-app = FastAPI(title="Tradomate API", version="0.3.0", default_response_class=ORJSONResponse)
+app = FastAPI(title="Tradomate API", version="0.3.0")
 
 # CORS: CLIENT_URL may be comma-separated (e.g. "http://localhost:5173,https://app.vercel.app").
 # Set CORS_ORIGINS env var to override entirely.
