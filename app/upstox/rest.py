@@ -349,6 +349,40 @@ async def historical_candles(inst: Instrument, interval: str, count: int) -> lis
     return out[-count:]
 
 
+async def intraday_supplement(inst: Instrument, interval: str) -> list[dict]:
+    """Today's in-progress session bars for `interval`, aggregated from 1m intraday.
+
+    The Upstox intraday endpoint reliably supports ONLY minutes/1, so we always
+    fetch minutes/1 and aggregate up with the same MOPEN_UTC anchor the frontend
+    barTs() uses — guaranteeing today's live bars land on the same timestamps as
+    the stored historical candles (no duplicate at the history/live seam).
+
+    Returns bars ascending by time, or [] on any error / empty response.
+    """
+    unit, value = _UNIT_MAP.get(interval, ("days", 1))
+    key = urllib.parse.quote(inst.instrument_key, safe="")
+    mopen = _MCX_MOPEN_UTC if inst.kind == "commodity" else _MOPEN_UTC
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"{API_BASE}/v3/historical-candle/intraday/{key}/minutes/1",
+                headers=_headers(),
+            )
+        if not resp.is_success:
+            return []
+        raw_1m = _parse_rows(resp.json().get("data", {}).get("candles", []) or [])
+        if not raw_1m:
+            return []
+        if unit == "minutes" and value == 1:
+            bars = raw_1m
+        else:
+            bars = _aggregate_bars(raw_1m, unit, value, mopen)
+        return sorted(bars.values(), key=lambda c: c["time"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"[history] intraday supplement failed ({inst.symbol} {interval}): {exc}")
+        return []
+
+
 async def ltp(inst: Instrument) -> dict | None:
     key = urllib.parse.quote(inst.instrument_key, safe="")
     url = f"{API_BASE}/v3/market-quote/ltp?instrument_key={key}"

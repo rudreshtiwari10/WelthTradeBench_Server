@@ -21,6 +21,8 @@ from .instruments import Instrument, by_symbol, search
 from .mcx_instruments import refresh as _mcx_refresh, active_key as _mcx_active_key
 from .routers import auth as _auth_router, layouts as _layouts_router, drawings as _drawings_router, admin as _admin_router
 from .historical.router import router as _historical_router
+from .historical.config import is_stored_symbol
+from .historical.store import get_chart_candles
 from .mock.generator import (
     generate_candles, generate_option_candles,
     generate_futures_candles, option_premium_py,
@@ -184,12 +186,47 @@ async def history(
     interval: str = "1D",
     count: int = 600,
     instrument_key: str | None = None,
+    before_ts: int | None = None,
 ) -> dict:
-    count = max(50, min(count, 2000))
+    count = max(50, min(count, 5000))
     candles: list[dict] = []
     info: dict | None = None
     source = "mock"
     source_warning: str | None = None   # surfaced to frontend when Upstox falls back to mock
+
+    # ── Stored-symbol path: serve old candles from the local 1m/1D store ──
+    # Old candles come from MongoDB (aggregated to the requested interval); only
+    # today's in-progress session is fetched live and merged on top.  before_ts
+    # drives lazy scroll-back paging (older bars only).
+    if not instrument_key and is_stored_symbol(symbol):
+        try:
+            stored = await get_chart_candles(symbol, interval, count, before_ts)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[history] store read failed ({symbol} {interval}): {exc}")
+            stored = []
+        # Use the store when it has data, OR for any paging request (a paging
+        # request with no data simply means "no older history" → return empty).
+        if stored or before_ts is not None:
+            if stored and before_ts is None and hub.mode == "upstox":
+                inst0 = by_symbol(symbol)
+                if inst0:
+                    today = await rest.intraday_supplement(inst0, interval)
+                    if today:
+                        merged = {c["time"]: c for c in stored}
+                        for c in today:
+                            merged[c["time"]] = c
+                        stored = sorted(merged.values(), key=lambda c: c["time"])
+            inst0 = by_symbol(symbol)
+            info0 = (
+                {"symbol": inst0.symbol, "name": inst0.name, "exchange": inst0.exchange, "kind": inst0.kind}
+                if inst0 else {"symbol": symbol, "name": symbol, "exchange": "NSE", "kind": "index"}
+            )
+            return {
+                "symbol": symbol, "interval": interval,
+                "source": "historical_store", "source_warning": None,
+                "info": info0, "candles": stored,
+            }
+        # Store not yet downloaded for this symbol → fall through to live/mock.
 
     # ── Direct instrument-key path (options / futures) ────────────────
     if instrument_key:
@@ -792,8 +829,8 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
     try:
         from fastapi.responses import Response as _Resp
         import orjson as _orjson
-        from .historical.store import has_sufficient_data, query_candles as _hist_query
-        if await has_sufficient_data(sym_upper, interval, min_candles=200):
+        from .historical.store import has_sufficient_data, get_chart_candles as _hist_query, _base_timeframe
+        if await has_sufficient_data(sym_upper, _base_timeframe(interval), min_candles=200):
             _cache_key = (sym_upper, interval)
             _cached = _BACKTEST_CACHE.get(_cache_key)
             if _cached and (_time_mod.time() - _cached[1]) < _BACKTEST_CACHE_TTL:
@@ -805,7 +842,7 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
                 )
             # Cache miss: read MongoDB, build payload, gzip once, cache bytes.
             print(f"[backtest] cache miss {sym_upper}/{interval} — loading from MongoDB")
-            stored = await _hist_query(sym_upper, interval, limit=0)
+            stored = await _hist_query(sym_upper, interval, count=20000)
             if stored:
                 inst = by_symbol(symbol)
                 _info = (

@@ -9,9 +9,12 @@ import asyncio
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
+from ..database import get_db
 from ..instruments import by_symbol
 from ..upstox.feed import hub
 from .backfill import BACKFILL_TARGET_DAYS, backfill_full
+from .config import stored_symbols
+from .yf_backfill import backfill_yf_daily
 from .gap_detector import detect_gaps
 from .scheduler import DEFAULT_TIMEFRAMES
 from .store import (
@@ -25,8 +28,53 @@ from .store import (
 
 router = APIRouter(prefix="/api/historical", tags=["historical"])
 
-# Tracks running download tasks: symbol → asyncio.Task
+# Tracks running download tasks: "SYMBOL_tf" → asyncio.Task
 _running: dict[str, asyncio.Task] = {}
+
+
+def _launch_download(symbol: str, timeframes: list[str], target_days: int) -> list[str]:
+    """Spawn one background download task per (symbol, timeframe) not already running.
+
+    Returns the list of timeframes that were actually launched.
+    """
+    sym = symbol.upper()
+    inst = by_symbol(sym)
+    if not inst:
+        return []
+    launched: list[str] = []
+    for tf in timeframes:
+        key = f"{sym}_{tf}"
+        existing = _running.get(key)
+        if existing and not existing.done():
+            continue  # already running
+
+        async def _run_tf(tf: str = tf) -> None:
+            years = max(1, target_days // 365)
+            print(f"[download] Starting {sym}/{tf} — {years} years")
+            try:
+                if tf == "1D":
+                    # Daily base: yfinance gives the deepest history (10+ years).
+                    # Fall back to Upstox daily only if yfinance returns nothing.
+                    result = await backfill_yf_daily(inst, years=years)
+                    print(f"[download] {sym}/1D via yfinance ({result['ticker']}): "
+                          f"+{result['upserted']} candles, total={result['total']}")
+                    if result["total"] == 0:
+                        print(f"[download] {sym}/1D yfinance empty — falling back to Upstox daily")
+                        result = await backfill_full(inst, "1D", target_days=target_days)
+                        print(f"[download] {sym}/1D via Upstox: {result.get('total_upserted', 0)} candles")
+                else:
+                    # Intraday base (1m): Upstox only — no free deep intraday source.
+                    result = await backfill_full(inst, tf, target_days=target_days)
+                    print(f"[download] {sym}/{tf} complete: "
+                          f"{result.get('total_upserted', 0)} candles, {result.get('chunks', 0)} chunks")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[download] {sym}/{tf} error: {exc}")
+            finally:
+                _running.pop(f"{sym}_{tf}", None)
+
+        _running[key] = asyncio.get_event_loop().create_task(_run_tf(), name=f"download_{sym}_{tf}")
+        launched.append(tf)
+    return launched
 
 
 # ---------------------------------------------------------------------------
@@ -67,45 +115,75 @@ async def download_symbol(
         for tf in timeframes:
             await update_sync_state(symbol.upper(), tf, backfill_complete=False)
 
-    # Duplicate guard is per symbol+timeframe so different timeframes can run in parallel
-    already_running = [
-        tf for tf in timeframes
-        if not _running.get(f"{symbol.upper()}_{tf}", asyncio.Future()).done()
-        and f"{symbol.upper()}_{tf}" in _running
-    ]
-    if already_running:
+    launched = _launch_download(symbol, timeframes, target_days)
+    if not launched:
         return {
             "triggered":      False,
             "reason":         "already_running",
             "symbol":         symbol,
-            "timeframes_busy": already_running,
+            "timeframes_busy": timeframes,
         }
-
-    async def _run_tf(tf: str) -> None:
-        key = f"{symbol.upper()}_{tf}"
-        print(f"[download] Starting {symbol.upper()}/{tf} — {years} years")
-        try:
-            result = await backfill_full(inst, tf, target_days=target_days)
-            print(
-                f"[download] {symbol.upper()}/{tf} complete: "
-                f"{result['total_upserted']} candles, {result['chunks']} chunks"
-            )
-        except Exception as exc:
-            print(f"[download] {symbol.upper()}/{tf} error: {exc}")
-        finally:
-            _running.pop(key, None)
-
-    for tf in timeframes:
-        key = f"{symbol.upper()}_{tf}"
-        task = asyncio.get_event_loop().create_task(_run_tf(tf), name=f"download_{symbol}_{tf}")
-        _running[key] = task
 
     return {
         "triggered":   True,
         "symbol":      symbol,
-        "timeframes":  timeframes,
+        "timeframes":  launched,
         "target_years": years,
         "note":        "Running in background. Poll /api/historical/status for progress.",
+    }
+
+
+@router.post("/download-all")
+async def download_all(
+    years: int = Query(5, ge=1, le=10),
+    force: bool = False,
+) -> dict:
+    """Download the configured base series (1m + 1D) for EVERY configured symbol.
+
+    Convenience entry point for a fresh start — equivalent to calling /download
+    for each symbol in HIST_SYMBOLS.  Runs in the background.
+    """
+    if hub.mode != "upstox":
+        raise HTTPException(status_code=403, detail="Upstox not authenticated")
+
+    target_days = years * 365
+    triggered: dict[str, list[str]] = {}
+    for sym in stored_symbols():
+        if force:
+            for tf in DEFAULT_TIMEFRAMES:
+                await update_sync_state(sym, tf, backfill_complete=False)
+        launched = _launch_download(sym, DEFAULT_TIMEFRAMES, target_days)
+        if launched:
+            triggered[sym] = launched
+
+    return {
+        "triggered":    bool(triggered),
+        "symbols":      list(triggered.keys()),
+        "timeframes":   DEFAULT_TIMEFRAMES,
+        "target_years": years,
+        "note":         "Running in background. Poll /api/historical/status for progress.",
+    }
+
+
+@router.post("/reset")
+async def reset_store() -> dict:
+    """Wipe ALL stored historical data and sync state — start completely fresh.
+
+    Drops every document from historical_candles + historical_sync_state and
+    evicts the backtest gzip cache.  Re-run /download-all afterwards.
+    """
+    db = get_db()
+    candles = await db.historical_candles.delete_many({})
+    states = await db.historical_sync_state.delete_many({})
+    try:
+        from ..main import _BACKTEST_CACHE
+        _BACKTEST_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return {
+        "ok":               True,
+        "candles_deleted":  candles.deleted_count,
+        "states_deleted":   states.deleted_count,
     }
 
 

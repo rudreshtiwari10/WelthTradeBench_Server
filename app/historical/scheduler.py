@@ -19,10 +19,14 @@ from ..upstox.feed import hub
 from .incremental import incremental_sync
 from .store import get_all_sync_states
 
-# Timeframes exposed as config so the download endpoint can read them
+# Base series we persist.  Everything else is aggregated on demand at read-time
+# (see store.get_chart_candles), so we store only "1m" (source of truth for all
+# intraday intervals) and "1D" (deep history for 1D/1W/1M).
+from .config import STORED_TIMEFRAMES
+
 DEFAULT_TIMEFRAMES: list[str] = [
     tf.strip()
-    for tf in os.getenv("HIST_TIMEFRAMES", "1D,1H,15m,5m,1m").split(",")
+    for tf in os.getenv("HIST_TIMEFRAMES", ",".join(STORED_TIMEFRAMES)).split(",")
     if tf.strip()
 ]
 
