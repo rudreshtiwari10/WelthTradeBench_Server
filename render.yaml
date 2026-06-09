@@ -5,10 +5,32 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      # Pin Python to match local dev — Render defaults to the newest (3.13),
+      # where several pinned deps have no wheels and fail to build/import.
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: PORT
         value: 8000
+      # Frontend origin (used for OAuth redirect AND CORS). Set to the Vercel URL,
+      # e.g. https://welth-trade-bench-client.vercel.app
       - key: CLIENT_URL
         sync: false
+      # Optional explicit CORS allow-list (comma-separated). *.vercel.app is always
+      # allowed via regex, so this is only needed for non-Vercel origins.
+      - key: CORS_ORIGINS
+        sync: false
+      # MongoDB Atlas connection string. REQUIRED for the historical store + auth.
+      # Atlas → Network Access must allow 0.0.0.0/0 (Render IPs are dynamic).
+      - key: MONGODB_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: HIST_SYMBOLS
+        value: "NIFTY,BANKNIFTY,SENSEX,NIFTY100,FINNIFTY,MIDCPNIFTY,BANKEX"
+      - key: HIST_TIMEFRAMES
+        value: "1m,1D"
       - key: UPSTOX_API_KEY
         sync: false
       - key: UPSTOX_API_SECRET
