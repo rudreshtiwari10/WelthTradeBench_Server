@@ -12,10 +12,13 @@ import os
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
-from .config import CLIENT_URL, SANDBOX, credentials_present, tokens
+from .config import (
+    CLIENT_URL, SANDBOX, credentials_present, tokens,
+    kite_credentials_present, kite_tokens,
+)
 from .database import connect_db, close_db
 from .instruments import Instrument, by_symbol, search
 from .mcx_instruments import refresh as _mcx_refresh, active_key as _mcx_active_key
@@ -29,18 +32,28 @@ from .mock.generator import (
 )
 from .upstox import auth, rest
 from .upstox.feed import hub
+from .kite import auth as kite_auth, rest as kite_rest, instruments as kite_instruments
 
 
 # ── Pydantic request models ───────────────────────────────────────────────
 
 class PlaceOrderBody(BaseModel):
-    instrument_key: str
+    instrument_key: str | None = None  # Upstox addressing
     qty: int
     transaction_type: str          # "BUY" | "SELL"
     order_type: str = "MARKET"     # "MARKET" | "LIMIT" | "SL" | "SL-M"
     price: float = 0.0
-    product: str = "D"             # "D" = NRML, "I" = MIS
+    product: str = "D"             # "D" = NRML/CNC, "I" = MIS
     trigger_price: float = 0.0
+    broker: str = "upstox"         # "upstox" | "kite"
+    segment: str = "option"        # "option" | "future" | "equity"
+    # Kite contract addressing:
+    tradingsymbol: str | None = None
+    exchange: str | None = None
+    underlying: str | None = None
+    expiry: str | None = None      # YYYY-MM-DD
+    strike: float | None = None
+    option_type: str | None = None  # "CE" | "PE"
 
 app = FastAPI(title="Tradomate API", version="0.3.0")
 
@@ -169,6 +182,58 @@ async def root(code: str | None = None, state: str | None = None):
 @app.post("/api/auth/logout")
 async def logout() -> dict:
     tokens.clear()
+    return {"ok": True}
+
+
+# ── Kite (Zerodha) OAuth ───────────────────────────────────────────────────
+
+def _oauth_done(qparam: str, value: str) -> HTMLResponse:
+    """Popup-aware OAuth responder.
+
+    When login was opened in a popup (the in-app "Authenticate" button) it
+    notifies the opener via postMessage and closes itself; when it was a plain
+    top-level redirect it navigates back to the SPA with a ?<qparam>=<value>
+    marker. The frontend popup flow depends on the {type:'broker-auth', ...}
+    message — keep it verbatim.
+    """
+    redirect = f"{CLIENT_URL}/?{qparam}={value}"
+    html = (
+        "<!doctype html><meta charset='utf-8'><title>Authentication</title>"
+        "<script>(function(){"
+        "try{if(window.opener){window.opener.postMessage("
+        "{type:'broker-auth',param:'" + qparam + "',status:'" + value + "'},'*');}}catch(e){}"
+        "if(window.opener){try{window.close();}catch(e){}}"
+        "setTimeout(function(){location.replace('" + redirect + "');},200);"
+        "})();</script>"
+        "<p style='font:14px sans-serif;padding:24px'>"
+        "Authentication complete — you can close this window.</p>"
+    )
+    return HTMLResponse(html)
+
+
+@app.get("/auth/kite/login")
+async def kite_login() -> RedirectResponse:
+    if not kite_credentials_present():
+        return RedirectResponse(f"{CLIENT_URL}/?kite_auth=missing_credentials")
+    return RedirectResponse(kite_auth.login_url())
+
+
+@app.get("/auth/kite/callback")
+async def kite_callback(request_token: str | None = None, status: str | None = None):
+    """Kite redirects here with ?request_token=...&status=success after login."""
+    if not request_token:
+        return _oauth_done("kite_auth", "error")
+    try:
+        kite_tokens.set(await kite_auth.exchange_token(request_token))
+        return _oauth_done("kite_auth", "success")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[kite] token exchange failed: {exc}")
+        return _oauth_done("kite_auth", "error")
+
+
+@app.post("/api/auth/kite/logout")
+async def kite_logout() -> dict:
+    kite_tokens.clear()
     return {"ok": True}
 
 
@@ -357,70 +422,139 @@ async def ws(websocket: WebSocket) -> None:
 # in paper-trading mode without crashing.
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _broker_check() -> None:
-    """Raise 403 if not authenticated with Upstox."""
-    if hub.mode != "upstox":
-        raise HTTPException(status_code=403, detail="Not authenticated with Upstox")
+def _kite_live() -> bool:
+    """True when Kite credentials are configured AND a fresh token is present."""
+    return kite_credentials_present() and kite_tokens.authenticated
+
+
+def _broker_live(broker: str) -> bool:
+    return _kite_live() if broker == "kite" else hub.mode == "upstox"
+
+
+def _broker_check(broker: str = "upstox") -> None:
+    """Raise 403 if not authenticated with the requested broker."""
+    if not _broker_live(broker):
+        name = "Kite" if broker == "kite" else "Upstox"
+        raise HTTPException(status_code=403, detail=f"Not authenticated with {name}")
 
 
 @app.get("/api/broker/status")
 async def broker_status() -> dict:
     return {
         "mode": hub.mode,
-        "authenticated": tokens.authenticated,
+        "authenticated": tokens.authenticated,          # upstox (primary, back-compat)
         "sandbox": SANDBOX,
         "credentialsPresent": credentials_present(),
+        "brokers": {
+            "upstox": {"authenticated": tokens.authenticated,
+                       "credentialsPresent": credentials_present(), "sandbox": SANDBOX},
+            "kite":   {"authenticated": kite_tokens.authenticated,
+                       "credentialsPresent": kite_credentials_present(), "sandbox": False},
+        },
     }
 
 
 # ── Funds ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/broker/funds")
-async def broker_funds() -> dict:
-    if hub.mode != "upstox":
+async def broker_funds(broker: str = Query("upstox")) -> dict:
+    if not _broker_live(broker):
         return {"source": "paper", "sandbox": False, "equity": {}, "commodity": {}}
     try:
+        if broker == "kite":
+            data = await kite_rest.get_funds()
+            return {"source": "kite", "sandbox": False, **data}
         data = await rest.get_funds()
         return {"source": "upstox", "sandbox": SANDBOX, **data}
     except Exception as exc:  # noqa: BLE001
-        print(f"[broker] funds error: {exc}")
+        print(f"[broker:{broker}] funds error: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ── Positions ─────────────────────────────────────────────────────────────
 
 @app.get("/api/broker/positions")
-async def broker_positions() -> dict:
-    if hub.mode != "upstox":
+async def broker_positions(broker: str = Query("upstox")) -> dict:
+    if not _broker_live(broker):
         return {"source": "paper", "sandbox": False, "positions": []}
     try:
+        if broker == "kite":
+            data = await kite_rest.get_positions()
+            return {"source": "kite", "sandbox": False, "positions": data}
         data = await rest.get_positions()
         return {"source": "upstox", "sandbox": SANDBOX, "positions": data}
     except Exception as exc:  # noqa: BLE001
-        print(f"[broker] positions error: {exc}")
+        print(f"[broker:{broker}] positions error: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ── Orders ────────────────────────────────────────────────────────────────
 
 @app.get("/api/broker/orders")
-async def broker_orders() -> dict:
-    if hub.mode != "upstox":
+async def broker_orders(broker: str = Query("upstox")) -> dict:
+    if not _broker_live(broker):
         return {"source": "paper", "sandbox": False, "orders": []}
     try:
+        if broker == "kite":
+            data = await kite_rest.get_orders()
+            return {"source": "kite", "sandbox": False, "orders": data}
         data = await rest.get_orders()
         return {"source": "upstox", "sandbox": SANDBOX, "orders": data}
     except Exception as exc:  # noqa: BLE001
-        print(f"[broker] orders error: {exc}")
+        print(f"[broker:{broker}] orders error: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ── Place order ───────────────────────────────────────────────────────────
 
+async def _resolve_kite_symbol(body: PlaceOrderBody) -> tuple[str, str]:
+    """Prefer an explicit tradingsymbol+exchange; else resolve from the dump."""
+    if body.tradingsymbol and body.exchange:
+        return body.tradingsymbol, body.exchange
+    if not (body.underlying and body.expiry):
+        raise ValueError(
+            "Kite order needs tradingsymbol+exchange OR underlying+expiry"
+            "(+strike+option_type for options)"
+        )
+    if body.segment == "future":
+        resolved = await kite_instruments.resolve_future(body.underlying, body.expiry)
+        if not resolved:
+            raise ValueError(f"No Kite future found for {body.underlying} {body.expiry}")
+        return resolved["tradingsymbol"], resolved["exchange"]
+    if not (body.strike and body.option_type):
+        raise ValueError("Kite option order needs underlying+expiry+strike+option_type")
+    resolved = await kite_instruments.resolve_option(
+        body.underlying, body.expiry, body.strike, body.option_type)
+    if not resolved:
+        raise ValueError(
+            f"No Kite contract found for {body.underlying} {body.expiry} "
+            f"{body.strike} {body.option_type}")
+    return resolved["tradingsymbol"], resolved["exchange"]
+
+
 @app.post("/api/broker/order")
 async def broker_place_order(body: PlaceOrderBody) -> dict:
-    _broker_check()
+    _broker_check(body.broker)
     try:
+        if body.broker == "kite":
+            if body.segment == "equity":
+                # Cash/equity: address the stock by tradingsymbol+exchange directly.
+                tradingsymbol = body.tradingsymbol or body.underlying
+                exchange = body.exchange or "NSE"
+                if not tradingsymbol:
+                    raise ValueError("Equity order needs a tradingsymbol/underlying")
+            else:
+                tradingsymbol, exchange = await _resolve_kite_symbol(body)
+            data = await kite_rest.place_order(
+                tradingsymbol=tradingsymbol, exchange=exchange, qty=body.qty,
+                transaction_type=body.transaction_type, order_type=body.order_type,
+                price=body.price, product=body.product,
+                trigger_price=body.trigger_price, segment=body.segment)
+            return {"source": "kite", "sandbox": False, **data}
+
+        # ── Upstox branch ──
+        if not body.instrument_key:
+            raise ValueError("Upstox order needs an instrument_key")
         data = await rest.place_order(
             instrument_key=body.instrument_key,
             qty=body.qty,
@@ -431,21 +565,26 @@ async def broker_place_order(body: PlaceOrderBody) -> dict:
             trigger_price=body.trigger_price,
         )
         return {"source": "upstox", "sandbox": SANDBOX, **data}
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
-        print(f"[broker] place_order error: {exc}")
+        print(f"[broker:{body.broker}] place_order error: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ── Cancel order ──────────────────────────────────────────────────────────
 
 @app.delete("/api/broker/order/{order_id}")
-async def broker_cancel_order(order_id: str) -> dict:
-    _broker_check()
+async def broker_cancel_order(order_id: str, broker: str = Query("upstox")) -> dict:
+    _broker_check(broker)
     try:
+        if broker == "kite":
+            data = await kite_rest.cancel_order(order_id)
+            return {"source": "kite", "sandbox": False, **data}
         data = await rest.cancel_order(order_id)
         return {"source": "upstox", "sandbox": SANDBOX, **data}
     except Exception as exc:  # noqa: BLE001
-        print(f"[broker] cancel_order error: {exc}")
+        print(f"[broker:{broker}] cancel_order error: {exc}")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
