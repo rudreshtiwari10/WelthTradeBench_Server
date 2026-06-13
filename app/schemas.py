@@ -30,6 +30,7 @@ class LayoutDoc(BaseModel):
     indicators: list[dict[str, Any]] = []
     gridLayout: str | None = None
     panels: list[dict[str, Any]] = []
+    settings: dict[str, Any] | None = None
 
 
 class DrawingsDoc(BaseModel):

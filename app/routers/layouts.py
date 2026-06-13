@@ -25,6 +25,7 @@ async def get_layouts(user: UserInDB = Depends(require_approved_user)) -> list[d
             "indicators": d.get("indicators", []),
             "gridLayout": d.get("gridLayout"),
             "panels": d.get("panels", []),
+            "settings": d.get("settings"),
         }
         for d in docs
     ]
@@ -48,6 +49,7 @@ async def create_layout(
             "indicators": body.indicators,
             "gridLayout": body.gridLayout,
             "panels": body.panels,
+            "settings": body.settings,
             "updated_at": datetime.now(timezone.utc),
         }},
         upsert=True,
@@ -72,6 +74,7 @@ async def update_layout(
             "indicators": body.indicators,
             "gridLayout": body.gridLayout,
             "panels": body.panels,
+            "settings": body.settings,
             "updated_at": datetime.now(timezone.utc),
         }},
     )

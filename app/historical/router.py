@@ -187,6 +187,88 @@ async def reset_store() -> dict:
     }
 
 
+@router.post("/reset-symbols")
+async def reset_symbols(
+    symbols: str,
+    timeframes: str | None = None,
+    years: int = Query(4, ge=1, le=10),
+) -> dict:
+    """Delete stored candles + sync state for specific symbols and re-download.
+
+    symbols   : comma-separated, e.g. NIFTY,BANKNIFTY
+    timeframes: comma-separated (default = all stored: 1m,1D)
+    years     : depth to re-download (default 4)
+
+    Uses the hybrid approach automatically — yfinance for 1D, Upstox for 1m.
+    Running downloads for the affected pairs are cancelled first.
+    """
+    if hub.mode != "upstox":
+        raise HTTPException(status_code=403, detail="Upstox not authenticated")
+
+    sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not sym_list:
+        raise HTTPException(status_code=400, detail="No symbols provided")
+
+    tf_list = (
+        [t.strip() for t in timeframes.split(",") if t.strip()]
+        if timeframes
+        else DEFAULT_TIMEFRAMES
+    )
+
+    db = get_db()
+    total_candles_deleted = 0
+    total_states_deleted = 0
+    all_launched: dict[str, list[str]] = {}
+
+    for sym in sym_list:
+        inst = by_symbol(sym)
+        if not inst:
+            continue
+
+        # Cancel any in-progress downloads first
+        for tf in tf_list:
+            key = f"{sym}_{tf}"
+            task = _running.get(key)
+            if task and not task.done():
+                task.cancel()
+                _running.pop(key, None)
+
+        # Delete candles and sync state for this symbol/timeframe set
+        for tf in tf_list:
+            res = await db.historical_candles.delete_many({"symbol": sym, "timeframe": tf})
+            total_candles_deleted += res.deleted_count
+            res2 = await db.historical_sync_state.delete_many({"symbol": sym, "timeframe": tf})
+            total_states_deleted += res2.deleted_count
+
+        # Evict backtest cache entries for this symbol
+        try:
+            from ..main import _BACKTEST_CACHE
+            for tf in tf_list:
+                _BACKTEST_CACHE.pop((sym, tf), None)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Launch fresh hybrid download
+        launched = _launch_download(sym, tf_list, years * 365)
+        if launched:
+            all_launched[sym] = launched
+
+    return {
+        "ok":                  True,
+        "symbols_reset":       sym_list,
+        "timeframes_reset":    tf_list,
+        "candles_deleted":     total_candles_deleted,
+        "states_deleted":      total_states_deleted,
+        "downloads_launched":  all_launched,
+        "target_years":        years,
+        "note": (
+            "Data deleted. Re-downloading in background — "
+            "yfinance for 1D (deep history), Upstox for 1m. "
+            "Poll /api/historical/status for progress."
+        ),
+    }
+
+
 @router.delete("/download/{symbol}")
 async def cancel_download(symbol: str, timeframe: str | None = None) -> dict:
     """Cancel a running download. Cancels all timeframes for the symbol, or just one."""
