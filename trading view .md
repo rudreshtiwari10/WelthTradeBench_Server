@@ -1,253 +1,497 @@
-TASK: Improve Trading Terminal Charting Experience
+You are a Senior Frontend Architect building a professional charting platform.
 
-We already have the chart integrated and working. I now want to improve the overall charting UX to be closer to TradingView's workflow and productivity.
+Current platform already has:
 
-Objective
+Candlestick chart
+Drawing tools
+Indicators
+Layouts
+Replay
+Watchlist
+Broker Integration
 
-Review the existing chart implementation and:
+Goal:
 
-Fix any non-working or partially working drawing tools.
-Improve drawing tool management.
-Add TradingView-style shortcuts.
-Improve usability for active traders.
-Add favorites system for drawing tools.
-Ensure the architecture remains scalable and modular.
-FEATURE 1: FAVORITE DRAWING TOOLS
+Make all drawing tools behave as close as possible to TradingView Desktop/Web.
 
-Implement a Favorites section at the top of the drawing toolbar.
+This is NOT a visual redesign.
 
-Requirements:
+This is a functionality and UX replication project.
 
-User can click ⭐ on any drawing tool.
-Favorited tools appear in a dedicated Favorites toolbar.
-Favorites persist across sessions.
-Store in localStorage initially.
-Future-ready for database sync.
+GLOBAL DRAWING TOOL WORKFLOW
 
-Example:
+Every drawing tool must follow this workflow:
 
-Favorites
-─────────────
-Trend Line
-Horizontal Line
-Ray
-Rectangle
-Long Position
-Short Position
-Fibonacci Retracement
-Text
-Arrow
+Creation
+Select Tool
+→ Cursor Changes
+→ User Places Points
+→ Drawing Created
+→ Drawing Selected Automatically
+→ Floating Toolbar Appears
+Selection
 
-Provide:
+Single click:
 
-Add Favorite
-Remove Favorite
-Reorder Favorites (drag & drop)
-FEATURE 2: DRAWING TOOL AUDIT
+Select Object
+Show Anchor Points
+Show Floating Toolbar
 
-Review all currently implemented tools.
+Double click:
 
-Verify:
+Open Full Settings Modal
 
-Selection works
-Creation works
-Dragging works
-Resizing works
-Deletion works
-Undo support works
-Redo support works
+Right click:
 
-Fix all issues found.
+Context Menu
+Dragging
 
-FEATURE 3: TRADINGVIEW-STYLE SHORTCUTS
+Support:
 
-Implement global keyboard shortcuts.
+Move Entire Object
+Move Individual Anchors
+Snap To Price
+Snap To Candle
+Object States
+Idle
+Hover
+Selected
+Locked
+Hidden
 
-Drawing Tools:
+Visual feedback required.
 
-Shortcut	Action
-Alt + T	Trend Line
-Alt + H	Horizontal Line
-Alt + R	Ray
-Alt + F	Fibonacci Retracement
-Alt + C	Rectangle
-Alt + A	Arrow
-Alt + X	Text Tool
-Alt + L	Long Position
-Alt + S	Short Position
+FLOATING TOOLBAR
 
-Chart Actions:
-
-Shortcut	Action
-Delete	Delete Selected Drawing
-Ctrl + Z	Undo
-Ctrl + Shift + Z	Redo
-Ctrl + C	Copy Drawing
-Ctrl + V	Paste Drawing
-Esc	Cancel Current Tool
-Space	Crosshair Tool
-H	Reset Chart View
-
-Navigation:
-
-Shortcut	Action
-1	1 Minute
-5	5 Minute
-15	15 Minute
-30	30 Minute
-60	1 Hour
-D	Daily
-W	Weekly
-FEATURE 4: DRAWING OBJECT MANAGER
-
-Add a panel similar to TradingView Object Tree.
-
-Show:
-
-Drawings
------------------
-Trend Line #1
-Trend Line #2
-Rectangle #1
-Fib #1
-Text Note #1
+When object selected show TradingView-style toolbar.
 
 Actions:
 
-Select
-Rename
+Color
+Line Style
+Line Width
+Text
+Lock
 Hide
-Show
-Lock
-Unlock
+Clone
+Copy
 Delete
-FEATURE 5: LOCK DRAWINGS
+Bring Forward
+Send Backward
+Object Tree
+Settings
+SETTINGS PANEL
 
-Add:
+All tools must support:
 
-Lock Drawing
-Unlock Drawing
+Style Tab
+Color
+Opacity
+Border Color
+Border Width
+Line Style
+Extend Left
+Extend Right
+Background Fill
+Show Price Labels
+Show Time Labels
+Coordinates Tab
+Price Values
+Time Values
+Anchor Coordinates
+Visibility Tab
+1m
+3m
+5m
+15m
+1h
+4h
+1D
+1W
+1M
 
-Locked drawings:
+Per timeframe visibility.
 
-Cannot move
-Cannot resize
-Cannot delete accidentally
+TOOL SPECIFICATIONS
+Trend Line
 
-Visual indicator:
-🔒 icon
+Workflow:
 
-FEATURE 6: DRAWING TEMPLATES
+Select Tool
+Click Start
+Click End
+Finish
 
-Allow saving style templates.
+Settings:
 
-Example:
+Color
+Width
+Style
+Extend Left
+Extend Right
+Ray
+Arrow
+Price Label
+Length
+Angle
 
-My Trendline Style
-Color: Blue
-Width: 2
-Dashed: False
+Shortcuts:
 
-User can:
+Alt + Drag = Clone
+Delete = Remove
+Ctrl + C = Copy
+Ctrl + V = Paste
+Arrowed Line
 
-Save Template
-Apply Template
-Delete Template
+Settings:
 
-Persist in localStorage.
+Arrow Type
+Arrow Size
+Line Width
+Line Color
+Horizontal Line
 
-FEATURE 7: MULTI-SELECT
+Settings:
 
-Implement:
+Price Label
+Line Color
+Line Width
+Line Style
+Alert Creation
+Vertical Line
 
-Shift + Click
-Box Selection
+Settings:
 
-Actions on multiple drawings:
+Date Label
+Line Color
+Line Width
+Ray
 
-Move
-Delete
+Settings:
+
+Direction
+Extend Forever
+Price Label
+Rectangle
+
+Workflow:
+
+Click
+Drag
+Release
+
+Settings:
+
+Fill Color
+Fill Opacity
+Border Color
+Border Width
+Border Style
+Extend Right
+
+Context Menu:
+
 Lock
-Change Style
-FEATURE 8: CONTEXT MENU
-
-Right-click on drawing:
-
-Edit
-Duplicate
-Lock
-Bring To Front
-Send To Back
+Clone
+Send Back
 Delete
-Add To Favorites
-FEATURE 9: DRAWING SEARCH
+Parallel Channel
 
-Inside object manager:
+Settings:
 
-Search drawings...
+Line Color
+Middle Line
+Fill Color
+Transparency
+Regression Channel
 
-Filter by:
+Settings:
 
-Type
-Name
-Created Date
-FEATURE 10: LONG / SHORT POSITION TOOL ENHANCEMENT
+Deviation
+Standard Deviation Bands
+Color
+Transparency
+Fibonacci Retracement
 
-Enhance position tools to display:
+Must replicate TradingView.
+
+Workflow:
+
+Point A
+Point B
+Auto Render Levels
+
+Default Levels:
+
+0
+0.236
+0.382
+0.5
+0.618
+0.786
+1
+1.272
+1.618
+2.618
+
+Settings:
+
+Enable/Disable Levels
+Custom Levels
+Custom Labels
+Reverse Fib
+Log Scale
+Background Fill
+
+Toolbar:
+
+Level Management
+Color Presets
+Fib Extension
+
+Same TradingView behavior.
+
+Settings:
+
+Extensions
+Labels
+Colors
+Reverse
+Fixed Range Volume Profile
+
+Must replicate TradingView workflow.
+
+Workflow:
+
+Select Tool
+Drag Start Point
+Drag End Point
+Volume Profile Generated
+
+Settings:
+
+Rows
+Value Area %
+POC
+VAH
+VAL
+Up Volume Color
+Down Volume Color
+Profile Width
+Show Labels
+Developing POC
+
+Toolbar:
+
+Color Settings
+Value Area
+POC
+Visibility
+
+Performance:
+
+WebWorker Processing
+Virtual Rendering
+Text Tool
+
+Settings:
+
+Font
+Size
+Bold
+Italic
+Underline
+Alignment
+Background
+Border
+Text Color
+
+Double click:
+
+Edit Text
+Text With Arrow
+
+Settings:
+
+Arrow Style
+Arrow Color
+Font
+Text
+Background
+Note Tool
+
+Support:
+
+Sticky Notes
+Multi-line
+Markdown
+Head and Shoulders Tool
+
+Workflow:
+
+Auto Pattern Shape
+User Adjust Anchors
+
+Settings:
+
+Label Visibility
+Target Projection
+Pattern Color
+Text Visibility
+Long Position Tool
+
+Must match TradingView.
+
+Fields:
 
 Entry
 Stop Loss
-Target
-Risk Amount
-Reward Amount
+Take Profit
+Risk %
+Account Size
+Quantity
 Risk Reward Ratio
+PnL
+
+Auto Calculate:
+
+Risk
+Reward
+RR
 Position Size
 
-Allow drag-to-adjust:
+Resizable by dragging.
 
-Entry
-SL
-Target
+Short Position Tool
 
-Realtime calculations update automatically.
+Same as Long Position.
 
-FEATURE 11: USER PREFERENCES
+Brush Tool
 
-Persist:
+Settings:
 
-Favorite tools
-Last selected tool
-Toolbar position
-Drawing templates
-Shortcut preferences
+Width
+Opacity
+Color
+Eraser
+Highlighter Tool
 
-Store via:
+Settings:
 
-localStorage
+Opacity
+Glow
+Width
+Measure Tool
 
-with clean abstraction layer for future backend sync.
+Workflow:
 
-CODE QUALITY REQUIREMENTS
-Modular architecture
-TypeScript types for all drawing entities
-Reusable hooks
-No duplicated logic
-Proper event cleanup
-Optimized rendering
-Avoid memory leaks
-Keep architecture ready for future multi-chart layouts
-DELIVERABLES
+Click
+Drag
+Show:
+Price Change
+Percent Change
+Bars
+Time
+Magnet Mode
 
-Provide:
+Support:
 
-Full implementation plan.
-Architecture changes required.
-New components to create.
-Existing components to modify.
-Data models/interfaces.
-Keyboard shortcut manager implementation.
-Favorites system implementation.
-Object manager implementation.
-Any performance concerns and optimizations.
+Weak Magnet
+Strong Magnet
+Off
 
-Do not provide only high-level suggestions. Review the current codebase and implement the changes.
+Snap to OHLC.
+
+OBJECT MANAGER
+
+Create TradingView-like object tree.
+
+Features:
+
+List All Drawings
+Search
+Lock
+Hide
+Delete
+Group
+Multi Select
+SHORTCUTS
+
+Implement TradingView-like shortcuts.
+
+Delete = Delete Object
+
+Ctrl + C = Copy
+
+Ctrl + V = Paste
+
+Ctrl + Z = Undo
+
+Ctrl + Shift + Z = Redo
+
+Alt + Drag = Clone
+
+Esc = Cancel Current Tool
+
+Shift = Straight Line Constraint
+
+Ctrl + Click = Multi Select
+
+Tab = Next Object
+
+Shift + Tab = Previous Object
+
+H = Horizontal Line
+
+Alt + H = Horizontal Ray
+
+V = Vertical Line
+
+T = Text
+
+R = Rectangle
+
+P = Parallel Channel
+
+F = Fib Retracement
+
+M = Measure Tool
+
+B = Brush
+
+L = Trend Line
+PERFORMANCE REQUIREMENTS
+
+Support:
+
+5000+ Drawings
+Multiple Layouts
+Autosave
+Undo/Redo History
+Object Persistence
+Cloud Sync Ready
+
+Use:
+
+React
+TypeScript
+Canvas Rendering
+RequestAnimationFrame
+Web Workers
+
+Goal:
+
+Make drawing tool UX, workflow, settings panels, context menus, shortcuts, selection behavior, editing behavior, and object management match TradingView as closely as possible while remaining compatible with the existing platform architecture.
+
+One additional recommendation: don't try to implement all 100+ TradingView tools at once. Prioritize:
+
+Trend Line
+Horizontal Line
+Rectangle
+Fib Retracement
+Long/Short Position
+Fixed Range Volume Profile
+Text Tools
+Channels
+
+These 8 tools cover roughly 90% of what traders actually use.

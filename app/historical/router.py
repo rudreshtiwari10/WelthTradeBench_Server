@@ -12,9 +12,11 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from ..database import get_db
 from ..instruments import by_symbol
 from ..upstox.feed import hub
+from ..config import kite_tokens
 from .backfill import BACKFILL_TARGET_DAYS, backfill_full
 from .config import stored_symbols
 from .yf_backfill import backfill_yf_daily
+from .kite_backfill import backfill_kite_1m
 from .gap_detector import detect_gaps
 from .scheduler import DEFAULT_TIMEFRAMES
 from .store import (
@@ -62,11 +64,18 @@ def _launch_download(symbol: str, timeframes: list[str], target_days: int) -> li
                         print(f"[download] {sym}/1D yfinance empty — falling back to Upstox daily")
                         result = await backfill_full(inst, "1D", target_days=target_days)
                         print(f"[download] {sym}/1D via Upstox: {result.get('total_upserted', 0)} candles")
-                else:
-                    # Intraday base (1m): Upstox only — no free deep intraday source.
+                elif hub.mode == "upstox":
+                    # Intraday via Upstox (authenticated).
                     result = await backfill_full(inst, tf, target_days=target_days)
-                    print(f"[download] {sym}/{tf} complete: "
+                    print(f"[download] {sym}/{tf} via Upstox: "
                           f"{result.get('total_upserted', 0)} candles, {result.get('chunks', 0)} chunks")
+                elif kite_tokens.authenticated:
+                    # Upstox not available — use Kite (60 days of 1m data).
+                    result = await backfill_kite_1m(inst, days=60)
+                    print(f"[download] {sym}/{tf} via Kite: "
+                          f"+{result.get('upserted', 0)} candles, total={result.get('total', 0)}")
+                else:
+                    raise ValueError("Neither Upstox nor Kite authenticated for intraday data")
             except Exception as exc:  # noqa: BLE001
                 print(f"[download] {sym}/{tf} error: {exc}")
             finally:
@@ -80,6 +89,89 @@ def _launch_download(symbol: str, timeframes: list[str], target_days: int) -> li
 # ---------------------------------------------------------------------------
 # Download endpoint — the main entry point
 # ---------------------------------------------------------------------------
+
+@router.post("/prefetch-yf")
+async def prefetch_yf(
+    symbol: str | None = None,
+    years: int = Query(4, ge=1, le=10),
+    force: bool = False,
+) -> dict:
+    """Download 1D daily data via yfinance for one or all configured symbols.
+
+    Does NOT require Upstox authentication — uses Yahoo Finance only.
+    Use this endpoint to seed data on a fresh deploy or after a data wipe.
+
+    symbol: specific symbol to seed (default = all configured symbols)
+    years : how many years of daily history to download (default 4)
+    force : re-download even if data already exists
+    """
+    from .yf_backfill import backfill_yf_daily
+    from .config import stored_symbols
+    from .store import count_candles
+
+    target_syms = [symbol.upper()] if symbol else stored_symbols()
+    results: dict[str, dict] = {}
+
+    for sym in target_syms:
+        inst = by_symbol(sym)
+        if not inst:
+            results[sym] = {"error": "unknown symbol"}
+            continue
+        try:
+            if not force:
+                n = await count_candles(sym, "1D")
+                if n >= 200:
+                    results[sym] = {"skipped": True, "existing_candles": n}
+                    continue
+            result = await backfill_yf_daily(inst, years=years)
+            results[sym] = {
+                "upserted": result["upserted"],
+                "total": result["total"],
+                "ticker": result["ticker"],
+            }
+        except Exception as exc:  # noqa: BLE001
+            results[sym] = {"error": str(exc)}
+
+    return {"ok": True, "years": years, "results": results}
+
+
+@router.post("/prefetch-kite-1m")
+async def prefetch_kite_1m(
+    symbol: str | None = None,
+    days: int = Query(60, ge=1, le=60),
+) -> dict:
+    """Download 1-minute intraday data via Zerodha Kite for one or all configured symbols.
+
+    Kite provides up to 60 days of 1m data. Requires Kite authentication.
+    symbol: specific symbol (default = BANKNIFTY + BANKEX + all configured symbols)
+    days  : how many days to look back (max 60)
+    """
+    if not kite_tokens.authenticated:
+        raise HTTPException(
+            status_code=403,
+            detail="Kite not authenticated. Log in to Zerodha Kite first.",
+        )
+    target_syms = [symbol.upper()] if symbol else stored_symbols()
+    results: dict[str, dict] = {}
+    for sym in target_syms:
+        inst = by_symbol(sym)
+        if not inst:
+            results[sym] = {"error": "unknown symbol"}
+            continue
+        try:
+            result = await backfill_kite_1m(inst, days=days)
+            if "error" in result:
+                results[sym] = {"error": result["error"]}
+            else:
+                results[sym] = {
+                    "upserted": result["upserted"],
+                    "total": result["total"],
+                    "token": result.get("token"),
+                }
+        except Exception as exc:
+            results[sym] = {"error": str(exc)}
+    return {"ok": True, "days": days, "results": results}
+
 
 @router.post("/download")
 async def download_symbol(
@@ -100,14 +192,20 @@ async def download_symbol(
     Runs in the background — poll /api/historical/status or
     /api/historical/pair-info to track progress.
     """
-    if hub.mode != "upstox":
-        raise HTTPException(status_code=403, detail="Upstox not authenticated")
+    timeframes_req = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
+    needs_intraday = any(tf != "1D" for tf in timeframes_req)
+    if needs_intraday and hub.mode != "upstox" and not kite_tokens.authenticated:
+        raise HTTPException(
+            status_code=403,
+            detail="Intraday data requires Upstox or Kite authentication. "
+                   "Log in to either broker, then retry. (1D data needs neither.)",
+        )
 
     inst = by_symbol(symbol)
     if not inst:
         raise HTTPException(status_code=404, detail=f"Unknown symbol: {symbol}")
 
-    timeframes = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
+    timeframes = timeframes_req
     target_days = years * 365
 
     # Reset backfill_complete so the download runs again from scratch
@@ -143,8 +241,13 @@ async def download_all(
     Convenience entry point for a fresh start — equivalent to calling /download
     for each symbol in HIST_SYMBOLS.  Runs in the background.
     """
-    if hub.mode != "upstox":
-        raise HTTPException(status_code=403, detail="Upstox not authenticated")
+    needs_intraday = any(tf != "1D" for tf in DEFAULT_TIMEFRAMES)
+    if needs_intraday and hub.mode != "upstox" and not kite_tokens.authenticated:
+        raise HTTPException(
+            status_code=403,
+            detail="Intraday data requires Upstox or Kite authentication. "
+                   "Log in to either broker first.",
+        )
 
     target_days = years * 365
     triggered: dict[str, list[str]] = {}
@@ -202,9 +305,6 @@ async def reset_symbols(
     Uses the hybrid approach automatically — yfinance for 1D, Upstox for 1m.
     Running downloads for the affected pairs are cancelled first.
     """
-    if hub.mode != "upstox":
-        raise HTTPException(status_code=403, detail="Upstox not authenticated")
-
     sym_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not sym_list:
         raise HTTPException(status_code=400, detail="No symbols provided")
@@ -214,6 +314,15 @@ async def reset_symbols(
         if timeframes
         else DEFAULT_TIMEFRAMES
     )
+
+    # Only require broker auth if intraday (1m) download is requested
+    needs_intraday = any(tf != "1D" for tf in tf_list)
+    if needs_intraday and hub.mode != "upstox" and not kite_tokens.authenticated:
+        raise HTTPException(
+            status_code=403,
+            detail="Intraday data requires Upstox or Kite authentication. "
+                   "Use ?timeframes=1D to reset only daily data without a broker login.",
+        )
 
     db = get_db()
     total_candles_deleted = 0

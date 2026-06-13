@@ -81,9 +81,41 @@ app.include_router(_admin_router.router)
 app.include_router(_historical_router)
 
 
+async def _auto_seed_daily() -> None:
+    """Background task: yfinance-seed 1D data for every configured symbol that
+    has fewer than 200 daily candles in MongoDB.
+
+    Runs once at startup — no Upstox auth required.  This keeps the chart
+    working on a fresh deploy or after a data wipe, even before the operator
+    authenticates with Upstox.
+    """
+    import asyncio as _asyncio
+    from .historical.config import stored_symbols as _syms
+    from .historical.store import count_candles as _count
+    from .historical.yf_backfill import backfill_yf_daily as _yf
+
+    await _asyncio.sleep(4)  # Let DB connection settle
+
+    for sym in _syms():
+        inst = by_symbol(sym)
+        if not inst:
+            continue
+        try:
+            n = await _count(sym, "1D")
+            if n >= 200:
+                print(f"[auto-seed] {sym}/1D: {n} candles already — skip")
+                continue
+            print(f"[auto-seed] {sym}/1D: only {n} candles — seeding via yfinance")
+            result = await _yf(inst, years=4)
+            print(f"[auto-seed] {sym}/1D done: +{result['upserted']} candles, total={result['total']}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[auto-seed] {sym}/1D failed: {exc}")
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     """Connect to MongoDB and pre-fetch MCX active contract keys."""
+    import asyncio as _asyncio
     try:
         await connect_db()
     except Exception as exc:  # noqa: BLE001
@@ -97,6 +129,8 @@ async def _startup() -> None:
         start_scheduler()
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] Historical EOD scheduler failed to start: {exc}")
+    # Seed 1D data for any symbol missing it — runs in background, no Upstox needed
+    _asyncio.get_event_loop().create_task(_auto_seed_daily())
 
 
 @app.on_event("shutdown")
@@ -984,7 +1018,7 @@ async def backtest_history(symbol: str, interval: str = "1D") -> dict:
                 )
             # Cache miss: read MongoDB, build payload, gzip once, cache bytes.
             print(f"[backtest] cache miss {sym_upper}/{interval} — loading from MongoDB")
-            stored = await _hist_query(sym_upper, interval, count=20000)
+            stored = await _hist_query(sym_upper, interval, count=0)
             if stored:
                 inst = by_symbol(symbol)
                 _info = (
